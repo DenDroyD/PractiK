@@ -1,4 +1,5 @@
 __pycache__/
 *.log
 .env
-data/models_cache/
+data/qdrant/
+data/models/
