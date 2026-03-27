@@ -2,38 +2,33 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-import groq
+from sentence_transformers import SentenceTransformer
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
+# Groq пока не используем, но переменную проверим
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY не задан")
 
 logging.basicConfig(level=logging.INFO)
 
-client = groq.Groq(api_key=GROQ_API_KEY)
+# Пробуем загрузить модель
+try:
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    logging.info("Модель эмбеддингов загружена")
+except Exception as e:
+    logging.exception("Ошибка загрузки модели")
+    raise
 
 async def start(update: Update, context):
-    await update.message.reply_text("Привет! Я бот, который отвечает с помощью Groq. Задай вопрос.")
+    await update.message.reply_text("Модель загружена, бот работает.")
 
 async def handle_message(update: Update, context):
-    user_text = update.message.text
-    logging.info(f"Пользователь: {user_text}")
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # быстрая модель
-            messages=[{"role": "user", "content": user_text}],
-            temperature=0.7,
-            max_tokens=256
-        )
-        answer = completion.choices[0].message.content
-        await update.message.reply_text(answer)
-    except Exception as e:
-        logging.exception("Ошибка при запросе к Groq")
-        await update.message.reply_text("Ошибка при обращении к Groq. Попробуйте позже.")
+    # Пока просто эхо
+    await update.message.reply_text("Я пока только тестирую модель эмбеддингов. Она загружена.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
