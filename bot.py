@@ -3,7 +3,6 @@ import os
 import sys
 import logging
 import asyncio
-from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -12,135 +11,82 @@ import groq
 # ===== НАСТРОЙКИ =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-MODEL_NAME = "all-MiniLM-L3-v2"
+USE_RAG = os.getenv("USE_RAG", "false").lower() == "true"  # Флаг для RAG
 
-# Проверка переменных окружения
+# Проверка переменных
 if not TELEGRAM_TOKEN:
-    print("❌ ОШИБКА: TELEGRAM_TOKEN не задан!", file=sys.stderr)
+    print("❌ TELEGRAM_TOKEN не задан", file=sys.stderr)
     sys.exit(1)
 if not GROQ_API_KEY:
-    print("❌ ОШИБКА: GROQ_API_KEY не задан!", file=sys.stderr)
+    print("❌ GROQ_API_KEY не задан", file=sys.stderr)
     sys.exit(1)
 
 # ===== ЛОГИРОВАНИЕ =====
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/app/bot.log", encoding="utf-8", mode="a")
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Создаем директории
-Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-CACHE_DIR = Path(DATA_DIR) / "models_cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-# ===== ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ =====
+# ===== GROQ КЛИЕНТ =====
 try:
     groq_client = groq.Groq(api_key=GROQ_API_KEY)
     logger.info("✅ Groq клиент инициализирован")
 except Exception as e:
-    logger.error(f"❌ Ошибка инициализации Groq: {e}")
+    logger.error(f"❌ Groq ошибка: {e}")
     groq_client = None
 
-# ===== ЗАГРУЗКА МОДЕЛИ ЭМБЕДДИНГОВ =====
+# ===== ЭМБЕДДИНГИ (опционально) =====
 embedder = None
-embedder_error = None
-
-def _load_embedding_model():
-    """Загрузка модели эмбеддингов"""
-    global embedder, embedder_error
+if USE_RAG:
+    logger.info("🔄 Попытка загрузить модель эмбеддингов...")
     try:
-        logger.info(f"🚀 Начинаю загрузку модели {MODEL_NAME}...")
-        
-        # Пробуем импортировать sentence-transformers
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:
-            logger.warning(f"⚠️ sentence-transformers не установлен: {e}")
-            logger.info("💡 Бот будет работать без RAG (векторного поиска)")
-            embedder_error = "sentence-transformers не установлен"
-            return False
-        
-        # Загружаем модель
-        embedder = SentenceTransformer(
-            MODEL_NAME,
-            cache_folder=str(CACHE_DIR),
-            device="cpu"
-        )
-        
+        from sentence_transformers import SentenceTransformer
+        embedder = SentenceTransformer('all-MiniLM-L3-v2', device='cpu')
         # Тестовый прогон
         _ = embedder.encode(["test"], batch_size=1, show_progress_bar=False)
-        
-        logger.info(f"✅ Модель {MODEL_NAME} загружена успешно!")
-        return True
-        
+        logger.info("✅ Модель эмбеддингов загружена")
     except Exception as e:
-        embedder_error = str(e)
-        logger.exception(f"❌ Ошибка загрузки модели: {e}")
-        logger.warning("💡 Бот продолжит работу без эмбеддингов")
-        return False
+        logger.warning(f"⚠️ Не удалось загрузить модель: {e}")
+        logger.warning("💡 Бот продолжит работу БЕЗ векторного поиска")
+        embedder = None
+else:
+    logger.info("ℹ️  RAG отключен (USE_RAG=false). Бот работает в базовом режиме.")
 
-# Загружаем модель при старте (в отдельном потоке)
-logger.info("🔄 Инициализация модели эмбеддингов...")
-try:
-    loop = asyncio.get_event_loop()
-    model_loaded = loop.run_in_executor(None, _load_embedding_model)
-    # Ждем завершения загрузки (но не более 120 секунд)
-    loop.run_until_complete(asyncio.wait_for(model_loaded, timeout=120))
-except asyncio.TimeoutError:
-    logger.error("⏰ Таймаут загрузки модели (120 сек)")
-    embedder_error = "Таймаут загрузки модели"
-except Exception as e:
-    logger.error(f"❌ Ошибка при инициализации модели: {e}")
-    embedder_error = str(e)
-
-# ===== ОБРАБОТЧИКИ КОМАНД =====
+# ===== ОБРАБОТЧИКИ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
-    status_model = "✅ загружена" if embedder else f"❌ не загружена"
-    status_groq = "✅ подключен" if groq_client else "❌ ошибка"
-    
+    status_rag = "✅ включён" if (USE_RAG and embedder) else "❌ выключен"
     await update.message.reply_text(
-        f"🤖 Бот запущен!\n\n"
-        f"🧠 Модель эмбеддингов: {status_model}\n"
-        f"🔗 Groq API: {status_groq}\n"
-        f"📁 Данные: {DATA_DIR}\n\n"
+        f"🤖 Бот запущен!\n"
+        f"🧠 RAG (векторный поиск): {status_rag}\n"
+        f"🔗 Groq API: {'✅' if groq_client else '❌'}\n\n"
         f"Отправьте сообщение для теста."
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений"""
     user_text = update.message.text
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    
-    logger.info(f"👤 User {user_id} (chat {chat_id}): {user_text[:100]}")
+    logger.info(f"👤 User {user_id}: {user_text[:100]}")
 
-    # 🔹 Шаг 1: Создание эмбеддинга (если модель доступна)
-    if embedder:
+    # 🔹 Опционально: создание эмбеддинга
+    if USE_RAG and embedder:
         try:
+            # Блокирующая операция — в отдельном потоке!
             embedding = await asyncio.to_thread(
                 lambda: embedder.encode([user_text], batch_size=1, show_progress_bar=False)[0]
             )
-            logger.debug(f"🧮 Эмбеддинг создан: {len(embedding)} dim")
+            logger.debug(f"🧮 Эмбеддинг: {len(embedding)} dim")
+            # Здесь позже будет поиск по векторной БД
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка создания эмбеддинга: {e}")
-    else:
-        logger.debug("⚠️ Модель эмбеддингов недоступна, пропускаем")
+            logger.warning(f"⚠️ Ошибка эмбеддинга: {e}")
 
-    # 🔹 Шаг 2: Запрос к Groq
+    # 🔹 Запрос к Groq
     if not groq_client:
-        await update.message.reply_text("❌ Groq API не доступен. Проверьте ключ.")
+        await update.message.reply_text("❌ Groq API не доступен")
         return
 
     try:
-        logger.info(f"🔄 Отправка запроса к Groq (модель: llama-3.1-8b-instant)...")
-        
         completion = await asyncio.wait_for(
             asyncio.to_thread(
                 lambda: groq_client.chat.completions.create(
@@ -153,35 +99,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             timeout=40
         )
-        
         answer = completion.choices[0].message.content
         await update.message.reply_text(answer)
-        logger.info(f"✅ Ответ отправлен пользователю {user_id}")
+        logger.info(f"✅ Ответ отправлен")
 
     except asyncio.TimeoutError:
-        logger.error("⏰ Таймаут запроса к Groq")
-        await update.message.reply_text("⏰ Превышено время ожидания ответа. Попробуйте позже.")
+        logger.error("⏰ Таймаут Groq")
+        await update.message.reply_text("⏰ Превышено время ожидания. Попробуйте позже.")
     except Exception as e:
-        logger.exception(f"❌ Ошибка Groq API: {e}")
+        logger.exception(f"❌ Ошибка: {e}")
         await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
 
-# ===== ЗАПУСК БОТА =====
+# ===== ЗАПУСК =====
 def main():
-    logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК БОТА")
-    logger.info(f"📁 DATA_DIR: {DATA_DIR}")
-    logger.info(f"🧠 Модель: {MODEL_NAME}")
-    logger.info(f"✅ Embedder: {'загружен' if embedder else 'не загружен'}")
-    logger.info(f"✅ Groq: {'подключен' if groq_client else 'ошибка'}")
-    logger.info("=" * 60)
-    
+    logger.info("🚀 Запуск бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("✅ Бот запущен и слушает обновления...")
+    logger.info("✅ Бот слушает обновления")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
