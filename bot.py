@@ -1,54 +1,43 @@
 import os
 import logging
-from flask import Flask, request
-import telegram
-import asyncio
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-app = Flask(__name__)
-
+# Загрузка переменных окружения
+load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-DOMAIN = os.getenv("DOMAIN")
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Проверка токена
 if not TELEGRAM_TOKEN:
-    logging.error("TELEGRAM_TOKEN не задан")
+    logger.error("TELEGRAM_TOKEN не задан")
     exit(1)
 
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+# Обработчик команды /start
+async def start(update: Update, context):
+    await update.message.reply_text("Привет! Я бот-помощник. Задай вопрос, и я отвечу.")
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    try:
-        update = telegram.Update.de_json(request.get_json(force=True), bot)
-        if update.message:
-            chat_id = update.message.chat_id
-            text = update.message.text
-            logging.info(f"Получено сообщение: {text}")
-            # Отвечаем эхом
-            bot.send_message(chat_id, f"Вы сказали: {text}")
-        return "ok"
-    except Exception as e:
-        logging.exception("Ошибка в вебхуке")
-        return "error", 500
+# Обработчик текстовых сообщений (эхо для теста)
+async def echo(update: Update, context):
+    user_text = update.message.text
+    logger.info(f"Получено сообщение: {user_text}")
+    await update.message.reply_text(f"Вы сказали: {user_text}")
 
-@app.route('/')
-def home():
-    return "OK"
+def main():
+    # Создаём приложение
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-async def set_webhook():
-    if not DOMAIN:
-        logging.error("DOMAIN не задан")
-        return
-    webhook_url = f"https://{DOMAIN}/webhook"
-    await bot.set_webhook(webhook_url)
-    logging.info(f"✅ Вебхук установлен: {webhook_url}")
+    # Добавляем обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Запускаем polling
+    logger.info("Бот запущен в режиме Long Polling")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Устанавливаем вебхук (один раз)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(set_webhook())
-
-    port = int(os.getenv("PORT", 3000))
-    app.run(host="0.0.0.0", port=port)
+    main()
