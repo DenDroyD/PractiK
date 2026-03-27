@@ -5,6 +5,7 @@ WORKDIR /app
 # Устанавливаем системные зависимости
 RUN apt-get update && apt-get install -y \
     gcc \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем requirements
@@ -23,10 +24,7 @@ os.makedirs(cache_dir, exist_ok=True); \
 model = SentenceTransformer('all-MiniLM-L3-v2', cache_folder=cache_dir, device='cpu'); \
 model.encode(['test'], batch_size=1, show_progress_bar=False); \
 print('✅ Модель успешно предзагружена в', cache_dir); \
-import os; \
-total_size = sum(f.stat().st_size for f in os.walk(cache_dir) for _, _, files in _ for f in [os.path.join(_, files)[0]]); \
-print(f'💾 Размер кэша: {total_size / 1024 / 1024:.1f} МБ') \
-"
+" || echo "⚠️ Предзагрузка модели не удалась, будет загружена при запуске"
 
 # Копируем весь код проекта
 COPY . .
