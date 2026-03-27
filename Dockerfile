@@ -15,42 +15,16 @@ COPY requirements.txt .
 # Устанавливаем зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ============================================
-# ПРЕДЗАГРУЗКА МОДЕЛИ (с игнорированием ошибок)
-# ============================================
-RUN python3 << 'EOF' || echo "⚠️ Предзагрузка не удалась — модель загрузится при запуске"
-import os
-from pathlib import Path
+# Копируем скрипт предзагрузки
+COPY preload_model.py .
 
-cache_dir = Path('/app/models_cache')
-cache_dir.mkdir(parents=True, exist_ok=True)
+# Запускаем предзагрузку модели
+RUN python preload_model.py || echo "⚠️ Предзагрузка не удалась — модель загрузится при запуске"
 
-print('🚀 Предзагрузка модели all-MiniLM-L3-v2...')
-
-try:
-    from sentence_transformers import SentenceTransformer
-    
-    model = SentenceTransformer(
-        'all-MiniLM-L3-v2',
-        cache_folder=str(cache_dir),
-        device='cpu',
-        trust_remote_code=True
-    )
-    
-    model.encode(['test'], batch_size=1, show_progress_bar=False)
-    
-    total_size = sum(f.stat().st_size for f in cache_dir.rglob('*') if f.is_file())
-    print(f'✅ Модель предзагружена! Размер: {total_size / 1024 / 1024:.1f} МБ')
-    
-except Exception as e:
-    print(f'⚠️ Предзагрузка не удалась: {e}')
-    # Не прерываем сборку!
-EOF
-
-# Копируем код
+# Копируем код бота
 COPY . .
 
-# Директории
+# Создаем директории
 RUN mkdir -p /app/data/docs /app/models_cache && chmod -R 777 /app/data
 
 ENV DATA_DIR=/app/data
