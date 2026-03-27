@@ -3,9 +3,12 @@ import os
 import sys
 import logging
 import asyncio
+import signal
 import traceback
-import numpy as np
+import time
 from pathlib import Path
+
+import numpy as np
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from bs4 import BeautifulSoup
@@ -73,14 +76,10 @@ def load_html_documents(docs_dir: Path) -> list:
             
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Удаляем скрипты, стили и ненужные элементы
             for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
                 tag.decompose()
             
-            # Извлекаем текст
             text = soup.get_text(separator=' ', strip=True)
-            
-            # Разбиваем на части по 1000 символов
             chunks = [text[i:i+1000] for i in range(0, len(text), 1000) if text[i:i+1000].strip()]
             
             for i, chunk in enumerate(chunks):
@@ -116,30 +115,54 @@ if USE_RAG:
     except:
         logger.info("💾 Информация о памяти недоступна")
     
-    # 1. Загрузка модели
+    # 1. Загрузка модели С ТАЙМАУТОМ
     try:
-        logger.info(f"🚀 Загрузка модели {MODEL_NAME}...")
-        from sentence_transformers import SentenceTransformer
-        
         cache_dir = Path(DATA_DIR) / "models_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Проверяем кэш
-        cache_files = list(cache_dir.rglob("*"))
-        if cache_files:
-            logger.info(f"✅ Найдено {len(cache_files)} файлов в кэше модели (используем кэш)")
+        model_files = list(cache_dir.rglob("*.bin")) + list(cache_dir.rglob("*.safetensors"))
+        if model_files:
+            logger.info(f"✅ Найдено {len(model_files)} файлов модели в кэше — загрузка будет быстрой")
         else:
-            logger.warning("⚠️ Кэш модели пуст. Модель будет загружена из интернета (медленно!)")
+            logger.warning(f"⚠️ Кэш пуст! Модель будет скачана из интернета (~200 МБ)")
         
-        embedder = SentenceTransformer(
-            MODEL_NAME,
-            cache_folder=str(cache_dir),
-            device="cpu"
-        )
+        logger.info(f"🚀 Загрузка модели {MODEL_NAME}...")
+        start_time = time.time()
         
-        # Тестовый прогон
-        _ = embedder.encode(["test"], batch_size=1, show_progress_bar=False)
-        logger.info(f"✅ Модель {MODEL_NAME} загружена успешно")
+        # Таймаут на загрузку
+        def timeout_handler(signum, frame):
+            raise TimeoutError("Загрузка модели превысила 90 секунд")
+        
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(90)
+        
+        try:
+            from sentence_transformers import SentenceTransformer
+            
+            embedder = SentenceTransformer(
+                MODEL_NAME,
+                cache_folder=str(cache_dir),
+                device="cpu",
+                trust_remote_code=True
+            )
+            
+            signal.alarm(0)  # Отменяем таймаут
+            
+            # Тестовый прогон
+            _ = embedder.encode(["test"], batch_size=1, show_progress_bar=False)
+            
+            elapsed = time.time() - start_time
+            logger.info(f"✅ Модель {MODEL_NAME} загружена за {elapsed:.1f} сек")
+            
+        except TimeoutError:
+            logger.error("⏰ ТАЙМАУТ загрузки модели (90 сек)!")
+            logger.error("💡 Причина: медленная сеть или проблемы с HuggingFace")
+            embedder = None
+            USE_RAG = False
+        except Exception as e:
+            signal.alarm(0)
+            raise e
         
     except MemoryError:
         logger.error("❌ НЕДОСТАТОЧНО ПАМЯТИ для загрузки модели!")
