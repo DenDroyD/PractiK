@@ -26,7 +26,7 @@ async def handle_message(update: Update, context):
         try:
             from sentence_transformers import SentenceTransformer
             logging.info("Загрузка модели эмбеддингов...")
-            embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            embedder = SentenceTransformer('all-MiniLM-L3-v2')
             context.bot_data['embedder'] = embedder
             logging.info("Модель загружена")
             await update.message.reply_text("Модель эмбеддингов загружена. Теперь можно задавать вопросы.")
