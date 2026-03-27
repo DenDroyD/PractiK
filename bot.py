@@ -2,33 +2,43 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from sentence_transformers import SentenceTransformer
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
-# Groq пока не используем, но переменную проверим
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY не задан")
 
 logging.basicConfig(level=logging.INFO)
 
-# Пробуем загрузить модель
-try:
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    logging.info("Модель эмбеддингов загружена")
-except Exception as e:
-    logging.exception("Ошибка загрузки модели")
-    raise
+# Импорт модели будет отложен
+# embedder = None
 
 async def start(update: Update, context):
-    await update.message.reply_text("Модель загружена, бот работает.")
+    await update.message.reply_text("Модель эмбеддингов загрузится при первом сообщении.")
 
 async def handle_message(update: Update, context):
+    global embedder
+    # Загружаем модель при первом сообщении
+    if 'embedder' not in context.bot_data:
+        try:
+            from sentence_transformers import SentenceTransformer
+            logging.info("Загрузка модели эмбеддингов...")
+            embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            context.bot_data['embedder'] = embedder
+            logging.info("Модель загружена")
+            await update.message.reply_text("Модель эмбеддингов загружена. Теперь можно задавать вопросы.")
+        except Exception as e:
+            logging.exception("Ошибка загрузки модели")
+            await update.message.reply_text("Ошибка загрузки модели. Попробуйте позже.")
+            return
+
+    embedder = context.bot_data['embedder']
+
     # Пока просто эхо
-    await update.message.reply_text("Я пока только тестирую модель эмбеддингов. Она загружена.")
+    await update.message.reply_text("Модель загружена, бот работает.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
