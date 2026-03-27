@@ -1,114 +1,157 @@
-#!/usr/bin/env python3
-import os, sys, logging, asyncio, time
-from pathlib import Path
+import os
+import logging
+import glob
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from bs4 import BeautifulSoup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import groq
+from fastembed import TextEmbedding
+import chromadb
+from bs4 import BeautifulSoup
 
-# ===== НАСТРОЙКИ =====
+# ========== НАСТРОЙКА ПЕРЕМЕННЫХ ==========
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-USE_RAG = os.getenv("USE_RAG", "false").lower() == "true"  # ← ПО УМОЛЧАНИЮ FALSE!
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-DOCS_DIR = Path(DATA_DIR) / "docs"
 
-if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-    print("❌ Заполните TELEGRAM_TOKEN и GROQ_API_KEY", file=sys.stderr)
-    sys.exit(1)
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не задан")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY не задан")
 
-# ===== ЛОГИ =====
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== GROQ =====
-try:
-    groq_client = groq.Groq(api_key=GROQ_API_KEY)
-    logger.info("✅ Groq подключён")
-except:
-    groq_client = None
+# ========== ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ ==========
+groq_client = groq.Groq(api_key=GROQ_API_KEY)
 
-# ===== RAG (опционально, с защитой) =====
-embedder = None
-docs_cache = []
+# FastEmbed (лёгкие эмбеддинги)
+logger.info("Загрузка модели эмбеддингов FastEmbed...")
+embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+logger.info("Модель эмбеддингов загружена")
 
-if USE_RAG:
-    logger.info("🔄 Попытка включить RAG...")
-    try:
-        from sentence_transformers import SentenceTransformer
-        cache_dir = Path(DATA_DIR) / "models_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info("⏳ Загрузка модели (может занять 1-2 мин при первом запуске)...")
-        embedder = SentenceTransformer('all-MiniLM-L3-v2', cache_folder=str(cache_dir), device='cpu')
-        
-        # Загрузка документов
-        for f in DOCS_DIR.glob("*.html"):
-            try:
-                text = BeautifulSoup(f.read_text(encoding='utf-8'), 'html.parser').get_text(separator=' ', strip=True)
-                for i in range(0, len(text), 800):
-                    docs_cache.append({"text": text[i:i+800].strip(), "source": f.name})
-                logger.info(f"✅ Загружен {f.name}")
-            except Exception as e:
-                logger.warning(f"⚠️ Не загружен {f.name}: {e}")
-        
-        logger.info(f"📚 Документов в кэше: {len(docs_cache)}")
-        
-    except Exception as e:
-        logger.error(f"❌ RAG не активирован: {e}")
-        logger.info("💡 Бот будет работать без поиска по документам")
-        USE_RAG = False
+# ChromaDB (векторная БД)
+CHROMA_PATH = "./chroma_db"
+DOCS_DIR = "/app/data/docs"          # папка с документами (создаётся автоматически)
 
-# ===== ОБРАБОТЧИКИ =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+os.makedirs(DOCS_DIR, exist_ok=True)
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_or_create_collection(name="docs")
+
+# ========== ФУНКЦИИ РАБОТЫ С ДОКУМЕНТАМИ ==========
+def extract_text_from_html(html_path):
+    """Извлечь текст из HTML-файла, удалив скрипты и стили."""
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'html.parser')
+        for tag in soup(['script', 'style', 'comment']):
+            tag.decompose()
+        text = soup.get_text(separator='\n')
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return '\n'.join(lines)
+
+def index_documents():
+    """Проиндексировать все HTML-файлы из DOCS_DIR в ChromaDB."""
+    html_files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
+    if not html_files:
+        logger.warning(f"В папке {DOCS_DIR} нет HTML-файлов. Индексация не выполнена.")
+        return
+
+    logger.info(f"Найдено {len(html_files)} HTML-файлов. Начинаем индексацию...")
+    for file_path in html_files:
+        text = extract_text_from_html(file_path)
+        if not text:
+            logger.warning(f"Не удалось извлечь текст из {file_path}")
+            continue
+
+        # Разбиваем текст на чанки (простой способ: по 1000 символов с перекрытием)
+        chunk_size = 1000
+        overlap = 200
+        chunks = []
+        for i in range(0, len(text), chunk_size - overlap):
+            chunks.append(text[i:i + chunk_size])
+
+        # Генерируем эмбеддинги для всех чанков
+        embeddings = list(embedder.embed(chunks))
+
+        file_name = os.path.basename(file_path)
+        ids = [f"{file_name}_{i}" for i in range(len(chunks))]
+        metadatas = [{"source": file_name} for _ in chunks]
+
+        collection.add(
+            embeddings=embeddings,
+            documents=chunks,
+            metadatas=metadatas,
+            ids=ids
+        )
+        logger.info(f"Индексирован {file_name}: {len(chunks)} чанков")
+
+# Индексация при первом запуске (если коллекция пуста)
+if collection.count() == 0:
+    logger.info("Коллекция пуста, начинаем индексацию документов...")
+    index_documents()
+else:
+    logger.info(f"Коллекция уже содержит {collection.count()} записей")
+
+# ========== ОБРАБОТЧИКИ TELEGRAM ==========
+async def start(update: Update, context):
     await update.message.reply_text(
-        f"🤖 Бот работает!\n"
-        f"🧠 RAG: {'✅' if USE_RAG and embedder else '❌'}\n"
-        f"📚 Документов: {len(docs_cache)}\n"
-        f"Задайте вопрос."
+        "Привет! Я ИИ-агент, обученный на вашей документации. Задайте вопрос, и я найду ответ."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    logger.info(f"👤 Вопрос: {text[:100]}")
-    
-    # 🔹 Поиск по документам (если RAG включён)
-    context_add = ""
-    if USE_RAG and embedder and docs_cache:
-        try:
-            q_emb = embedder.encode([text])[0]
-            scores = [(i, sum(q_emb * embedder.encode([d["text"]])[0])) for i, d in enumerate(docs_cache)]
-            top = sorted(scores, key=lambda x: x[1], reverse=True)[:2]
-            if top and top[0][1] > 0.3:
-                context_add = "\n\nКонтекст:\n" + "\n".join([docs_cache[i]["text"] for i, _ in top])
-        except: pass
-    
-    # 🔹 Запрос к Groq
-    if not groq_client:
-        await update.message.reply_text("❌ Groq не доступен")
-        return
-    
-    try:
-        resp = await asyncio.to_thread(
-            lambda: groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": context_add + "\n\n" + text if context_add else text}],
-                max_tokens=512, timeout=30
-            )
-        )
-        await update.message.reply_text(resp.choices[0].message.content)
-    except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-        await update.message.reply_text("⚠️ Ошибка ответа")
+async def handle_message(update: Update, context):
+    user_text = update.message.text
+    logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
 
-# ===== ЗАПУСК =====
+    # 1. Преобразуем вопрос в эмбеддинг
+    query_embedding = list(embedder.embed([user_text]))[0]
+
+    # 2. Ищем похожие чанки
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=3,
+        include=["documents", "metadatas"]
+    )
+
+    if not results['documents'][0]:
+        await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
+        return
+
+    # 3. Собираем контекст
+    context_chunks = results['documents'][0]
+    sources = list(set(meta['source'] for meta in results['metadatas'][0]))
+    context_text = "\n\n".join(context_chunks)
+
+    # 4. Формируем промпт
+    system_prompt = (
+        "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
+        "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
+        "Контекст:\n{context}\n\nВопрос: {question}\n\nОтвет:"
+    )
+    prompt = system_prompt.format(context=context_text, question=user_text)
+
+    # 5. Вызываем Groq
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",   # можно заменить на "llama-3.3-70b-versatile"
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1024
+        )
+        answer = completion.choices[0].message.content
+    except Exception as e:
+        logger.exception("Ошибка при запросе к Groq")
+        await update.message.reply_text("Произошла ошибка при генерации ответа. Попробуйте позже.")
+        return
+
+    source_line = f"\n\n📄 Источники: {', '.join(sources)}"
+    final_answer = answer + source_line
+    await update.message.reply_text(final_answer)
+
+# ========== ЗАПУСК БОТА ==========
 def main():
-    logger.info("🚀 Старт...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling(drop_pending_updates=True)
+    logger.info("Бот запущен в режиме long polling")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
