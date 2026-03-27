@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import asyncio
+import traceback
 import numpy as np
 from pathlib import Path
 from telegram import Update
@@ -14,7 +15,7 @@ import groq
 # ===== НАСТРОЙКИ =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-USE_RAG = os.getenv("USE_RAG", "false").lower() == "true"
+USE_RAG = os.getenv("USE_RAG", "true").lower() == "true"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 DOCS_DIR = Path(DATA_DIR) / "docs"
 MODEL_NAME = "all-MiniLM-L3-v2"
@@ -39,8 +40,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Создаем директории
-Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"📁 Директории: DATA_DIR={DATA_DIR}, DOCS_DIR={DOCS_DIR}")
+except Exception as e:
+    logger.warning(f"⚠️ Не удалось создать директории: {e}")
 
 # ===== GROQ КЛИЕНТ =====
 try:
@@ -66,17 +71,16 @@ def load_html_documents(docs_dir: Path) -> list:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Парсинг HTML
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Удаляем скрипты и стили
+            # Удаляем скрипты, стили и ненужные элементы
             for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
                 tag.decompose()
             
             # Извлекаем текст
             text = soup.get_text(separator=' ', strip=True)
             
-            # Разбиваем на части по 1000 символов (для лучшей точности поиска)
+            # Разбиваем на части по 1000 символов
             chunks = [text[i:i+1000] for i in range(0, len(text), 1000) if text[i:i+1000].strip()]
             
             for i, chunk in enumerate(chunks):
@@ -104,6 +108,14 @@ if USE_RAG:
     logger.info("🔄 ИНИЦИАЛИЗАЦИЯ RAG СИСТЕМЫ")
     logger.info("=" * 60)
     
+    # Проверяем память
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        logger.info(f"💾 Память: всего={mem.total/1024/1024:.0f}МБ, доступно={mem.available/1024/1024:.0f}МБ")
+    except:
+        logger.info("💾 Информация о памяти недоступна")
+    
     # 1. Загрузка модели
     try:
         logger.info(f"🚀 Загрузка модели {MODEL_NAME}...")
@@ -111,6 +123,13 @@ if USE_RAG:
         
         cache_dir = Path(DATA_DIR) / "models_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Проверяем кэш
+        cache_files = list(cache_dir.rglob("*"))
+        if cache_files:
+            logger.info(f"✅ Найдено {len(cache_files)} файлов в кэше модели (используем кэш)")
+        else:
+            logger.warning("⚠️ Кэш модели пуст. Модель будет загружена из интернета (медленно!)")
         
         embedder = SentenceTransformer(
             MODEL_NAME,
@@ -122,24 +141,27 @@ if USE_RAG:
         _ = embedder.encode(["test"], batch_size=1, show_progress_bar=False)
         logger.info(f"✅ Модель {MODEL_NAME} загружена успешно")
         
+    except MemoryError:
+        logger.error("❌ НЕДОСТАТОЧНО ПАМЯТИ для загрузки модели!")
+        embedder = None
+        USE_RAG = False
+        
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки модели: {e}")
-        logger.warning("💡 RAG будет отключён")
+        logger.error(f"📋 Трассировка: {traceback.format_exc()}")
         embedder = None
         USE_RAG = False
     
-    # 2. Загрузка документов (если модель загрузилась)
+    # 2. Загрузка документов
     if embedder:
         logger.info("📂 Загрузка документов...")
         documents = load_html_documents(DOCS_DIR)
         
         if documents:
-            # 3. Создание эмбеддингов для всех документов
             try:
                 logger.info("🧮 Создание векторных представлений...")
                 doc_texts = [doc["text"] for doc in documents]
                 
-                # Создаём эмбеддинги пачками по 16 документов
                 all_embeddings = []
                 for i in range(0, len(doc_texts), 16):
                     batch = doc_texts[i:i+16]
@@ -152,7 +174,6 @@ if USE_RAG:
                     all_embeddings.extend(embeddings)
                     logger.info(f"📊 Обработано {min(i+16, len(doc_texts))}/{len(doc_texts)} частей")
                 
-                # Сохраняем как numpy array
                 vector_store = np.array(all_embeddings)
                 logger.info(f"✅ Векторное хранилище создано: {vector_store.shape}")
                 
@@ -172,20 +193,17 @@ def search_documents(query: str, top_k: int = 3) -> list:
         return []
     
     try:
-        # Создаём эмбеддинг запроса
         query_embedding = embedder.encode([query], convert_to_numpy=True)[0]
         
-        # Косинусное сходство
         similarities = np.dot(vector_store, query_embedding) / (
             np.linalg.norm(vector_store, axis=1) * np.linalg.norm(query_embedding)
         )
         
-        # Топ-K наиболее похожих
         top_indices = np.argsort(similarities)[-top_k:][::-1]
         
         results = []
         for idx in top_indices:
-            if similarities[idx] > 0.3:  # Порог релевантности
+            if similarities[idx] > 0.3:
                 results.append({
                     **documents[idx],
                     "score": float(similarities[idx])
