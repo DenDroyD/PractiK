@@ -254,64 +254,49 @@ async def get_embedding(text: str) -> List[float]:
 # ==================== CHROMADB С ИСПРАВЛЕНИЯМИ ====================
 _collection = None
 
-def init_chroma(force_recreate: bool = False) -> chromadb.Collection:
-    """Инициализация ChromaDB с обработкой ошибок"""
-    global _collection
-    
-    try:
-        if force_recreate and CHROMA_PERSIST_DIR.exists():
-            logger.warning("Removing corrupted ChromaDB...")
-            shutil.rmtree(CHROMA_PERSIST_DIR)
-        
-        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
-        
-        chroma_client = chromadb.PersistentClient(
-            path=str(CHROMA_PERSIST_DIR),
-            settings=Settings(anonymized_telemetry=False),
-        )
-        
+import chromadb
+from chromadb.config import Settings
+import os
+
+def init_chroma(force_recreate=False):
+    # Путь к данным: используем DATA_DIR из окружения
+    data_dir = os.getenv("DATA_DIR", "/app/data")
+    chroma_client = chromadb.Client(Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory=data_dir,
+    ))
+
+    collection_name = "leasing_docs_v2"
+
+    if force_recreate:
         try:
-            if COLLECTION_NAME in [col.name for col in chroma_client.list_collections()]:
-                collection = chroma_client.get_collection(
-                    name=COLLECTION_NAME,
-                    metadata={
-                        "hnsw:space": "cosine",
-                        "hnsw:ef_search": 100,
-                    },
-                )
-                logger.info(f"Loaded existing collection: {COLLECTION_NAME}")
-            else:
-                collection = chroma_client.create_collection(
-                    name=COLLECTION_NAME,
-                    metadata={
-                        "hnsw:space": "cosine",
-                        "hnsw:ef_search": 100,
-                    },
-                )
-                logger.info(f"Created new collection: {COLLECTION_NAME}")
+            chroma_client.delete_collection(collection_name)
+            print(f"✅ Удалена существующая коллекция {collection_name}")
         except Exception as e:
-            logger.error(f"Error accessing collection: {e}. Recreating...")
-            try:
-                chroma_client.delete_collection(COLLECTION_NAME)
-            except:
-                pass
-            collection = chroma_client.create_collection(
-                name=COLLECTION_NAME,
-                metadata={
-                    "hnsw:space": "cosine",
-                    "hnsw:ef_search": 100,
-                },
-            )
-        
-        _collection = collection
+            # Если коллекции нет, просто проигнорируем
+            print(f"⚠️ Коллекция {collection_name} не найдена для удаления: {e}")
+
+    # Пытаемся получить или создать коллекцию
+    try:
+        # Допустимые метаданные для ChromaDB 0.5.23
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}  # только разрешённые параметры
+        )
+        print(f"✅ Коллекция {collection_name} готова")
         return collection
-        
     except Exception as e:
-        logger.error(f"ChromaDB initialization failed: {e}")
-        if not force_recreate:
-            logger.info("Trying to recreate ChromaDB from scratch...")
-            return init_chroma(force_recreate=True)
-        raise
+        # Если не удалось создать/получить коллекцию – возможно, данные повреждены
+        print(f"❌ Ошибка при работе с коллекцией: {e}")
+        # Пробуем принудительно удалить и создать заново
+        try:
+            chroma_client.delete_collection(collection_name)
+        except:
+            pass
+        # Создаём заново без метаданных (с настройками по умолчанию)
+        collection = chroma_client.create_collection(collection_name)
+        print(f"✅ Коллекция {collection_name} создана заново (с настройками по умолчанию)")
+        return collection
 
 def index_documents(collection: chromadb.Collection, docs_dir: Path = DOCS_DIR):
     """Индексация документов"""
