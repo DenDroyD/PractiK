@@ -21,7 +21,6 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
-# Используем ADMIN_USER_ID, если задан, иначе ADMIN_ID для обратной совместимости
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", os.getenv("ADMIN_ID", 0)))
 
 if not TELEGRAM_TOKEN:
@@ -41,17 +40,13 @@ logger = logging.getLogger(__name__)
 groq_client = groq.Groq(api_key=GROQ_API_KEY)
 
 # --- Настройки путей ---
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")      # основная папка для данных
-CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")  # где хранится ChromaDB
-DOCS_DIR = os.path.join(DATA_DIR, "docs")          # где лежат исходные HTML-файлы
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
+DOCS_DIR = os.path.join(DATA_DIR, "docs")
 os.makedirs(DOCS_DIR, exist_ok=True)
 
-# --- Инициализация ChromaDB с возможностью force_recreate ---
+# --- Инициализация ChromaDB ---
 def init_chroma(force_recreate=False):
-    """
-    Инициализирует постоянный клиент ChromaDB.
-    При force_recreate=True удаляет всю папку данных и создаёт коллекцию заново.
-    """
     if force_recreate and os.path.exists(CHROMA_PATH):
         try:
             shutil.rmtree(CHROMA_PATH)
@@ -73,7 +68,7 @@ def init_chroma(force_recreate=False):
     try:
         collection = client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # допустимые метаданные
+            metadata={"hnsw:space": "cosine"}
         )
         logger.info(f"✅ Коллекция {collection_name} готова")
         return collection
@@ -87,19 +82,50 @@ def init_chroma(force_recreate=False):
         logger.info(f"✅ Коллекция {collection_name} создана заново (с настройками по умолчанию)")
         return collection
 
-# Глобальная коллекция и клиент
 chroma_client = None
 collection = None
 
 # --- Глобальные переменные для BM25 ---
-corpus = []          # список всех чанков (текстов)
-bm25 = None          # объект BM25Okapi
-tokenized_corpus = []  # токенизированная версия
+corpus = []
+bm25 = None
+tokenized_corpus = []
 
 # --- Настройки поиска ---
-TOP_K_VECTOR = 10    # сколько чанков брать из векторного поиска
-TOP_K_FINAL = 5      # сколько оставить после гибридного ранжирования
-ALPHA = 0.6          # вес векторного поиска (1 - ALPHA вес BM25)
+TOP_K_VECTOR = 20          # увеличено для лучшего охвата
+TOP_K_FINAL = 5
+ALPHA = 0.6
+
+# --- Словарь для расшифровки сокращений ---
+ABBREVIATIONS = {
+    'ГТ': ['грузовой транспорт', 'грузовой', 'грузовик', 'грузоперевозки'],
+    'ЛА': ['легковой автомобиль', 'легковой', 'легковушка'],
+    'ЛКТ': ['легкий коммерческий транспорт', 'коммерческий транспорт', 'фургон', 'микроавтобус'],
+    'СТ': ['спецтехника', 'специальная техника', 'строительная техника'],
+    'ЛП': ['лизингополучатель', 'клиент', 'арендатор'],
+    'ЮЛ': ['юридическое лицо', 'организация', 'компания'],
+    'ИП': ['индивидуальный предприниматель'],
+    'ДЛ': ['договор лизинга'],
+    'ПЛ': ['предмет лизинга', 'оборудование', 'техника'],
+    'БКК': ['большой кредитный комитет'],
+    'МКК': ['малый кредитный комитет'],
+    'УКА': ['управление кредитного анализа'],
+    'СЭБ': ['служба экономической безопасности'],
+    'LTV': ['loan to value', 'соотношение займа и стоимости'],
+    'ROE': ['рентабельность собственного капитала'],
+}
+
+def expand_query(query: str) -> str:
+    """Заменяет сокращения в запросе на полные варианты для улучшения поиска."""
+    words = query.split()
+    expanded_words = []
+    for word in words:
+        word_upper = word.upper()
+        if word_upper in ABBREVIATIONS:
+            expanded_words.append(word)
+            expanded_words.extend(ABBREVIATIONS[word_upper])
+        else:
+            expanded_words.append(word)
+    return " ".join(expanded_words) + " " + query
 
 # --- Разбиение текста на чанки ---
 headers_to_split_on = [
@@ -140,20 +166,18 @@ def chunk_text(text):
 
 @lru_cache(maxsize=100)
 def get_embedding(text: str):
-    """Получение эмбеддинга через HF Inference API с кэшированием."""
     url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
     headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
     payload = {"inputs": [text], "options": {"wait_for_model": True}}
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        return resp.json()[0]   # список float
+        return resp.json()[0]
     except Exception as e:
         logger.exception("Ошибка получения эмбеддинга от Hugging Face")
         return None
 
 def update_bm25():
-    """Обновляет BM25-индекс на основе глобального corpus."""
     global bm25, tokenized_corpus
     if not corpus:
         bm25 = None
@@ -163,7 +187,6 @@ def update_bm25():
     bm25 = BM25Okapi(tokenized_corpus)
 
 def index_documents():
-    """Индексирует все HTML-файлы в DOCS_DIR."""
     global corpus, collection
     files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
     if not files:
@@ -204,7 +227,6 @@ def index_documents():
     if not all_chunks:
         return
 
-    # Очищаем коллекцию и добавляем новые данные
     try:
         chroma_client.delete_collection(collection.name)
         collection = chroma_client.create_collection(collection.name)
@@ -221,7 +243,7 @@ def index_documents():
     logger.info(f"Индексация завершена. Всего чанков: {len(all_chunks)}")
 
 # --- Память диалога ---
-user_histories = {}  # chat_id -> список кортежей (role, text)
+user_histories = {}
 
 # --- Обработчики команд ---
 async def start(update: Update, context):
@@ -231,7 +253,6 @@ async def start(update: Update, context):
     )
 
 async def reindex(update: Update, context):
-    """Принудительная переиндексация (только для администратора)."""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("У вас нет прав для этой команды.")
         return
@@ -244,29 +265,28 @@ async def reindex(update: Update, context):
         await update.message.reply_text(f"Ошибка: {e}")
 
 def hybrid_search(query: str):
-    """Выполняет гибридный поиск: векторный + BM25."""
-    query_embedding = get_embedding(query)
+    expanded_query = expand_query(query)
+    logger.debug(f"Расширенный запрос: {expanded_query}")
+
+    query_embedding = get_embedding(expanded_query)
     if query_embedding is None:
         logger.warning("Не удалось получить эмбеддинг запроса")
         return []
 
     vector_results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=TOP_K_VECTOR,
+        n_results=TOP_K_VECTOR * 2,
         include=["documents", "metadatas", "distances"]
     )
     if not vector_results['documents'][0]:
         return []
 
-    bm25_scores = {}
+    text_to_score = {}
     if bm25 and corpus:
-        tokenized_query = query.split()
+        tokenized_query = expanded_query.split()
         scores = bm25.get_scores(tokenized_query)
-        text_to_score = {}
         for i, doc in enumerate(corpus):
             text_to_score[doc] = scores[i]
-    else:
-        text_to_score = {}
 
     combined = []
     for i, doc in enumerate(vector_results['documents'][0]):
@@ -357,17 +377,14 @@ async def handle_message(update: Update, context):
 
 def main():
     global chroma_client, collection
-    # Инициализация ChromaDB (force_recreate=False при обычном запуске)
     chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
     collection = init_chroma(force_recreate=False)
 
-    # Если коллекция пуста или нужно обновить индексы, запускаем индексацию
     if collection.count() == 0:
         logger.info("Коллекция пуста, запускаем индексацию...")
         index_documents()
     else:
         logger.info(f"Коллекция уже содержит {collection.count()} записей")
-        # Для BM25 загружаем чанки из коллекции
         all_data = collection.get(include=["documents"])
         global corpus
         corpus = all_data.get('documents', [])
