@@ -2,33 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 Telegram RAG-бот для ЛК ПроДвижение
-Версия: 2.2 (с исправлением ChromaDB)
-Совместимость: bothost.ru, Python 3.11+, NumPy 1.26.4
+Версия: 1.1 (исправленная)
+Совместимость: chromadb==0.4.22, numpy==1.26.4
 """
 
 import os
-import sys
-import asyncio
 import logging
+import glob
 import hashlib
 import time
-import shutil
-from pathlib import Path
-from typing import List, Dict, Optional, Any
-from functools import wraps
-
+import asyncio
 from telegram import Update, constants
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
-
-from bs4 import BeautifulSoup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import groq
 import chromadb
-from chromadb.config import Settings
+from bs4 import BeautifulSoup
 import requests
 
 # ==================== КОНФИГУРАЦИЯ ====================
@@ -37,428 +25,147 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "477810377"))
 
-DATA_DIR = Path("/app/data")
-DOCS_DIR = DATA_DIR / "docs"
-CHROMA_PERSIST_DIR = DATA_DIR / "chroma_db"
-LOG_FILE = DATA_DIR / "bot.log"
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не задан")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY не задан")
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN не задан")
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL", 
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-)
-COLLECTION_NAME = "leasing_docs_v2"
-
-MAX_CHUNK_SIZE = 800
-CHUNK_OVERLAP = 100
-MAX_SEARCH_RESULTS = 5
-MAX_HISTORY_MESSAGES = 5
-MAX_PROMPT_TOKENS = 3500
-
-CACHE_TTL_EMBEDDINGS = 604800
-CACHE_TTL_RESPONSES = 86400
-
-SOURCE_PRIORITY = {
-    "usloviia-soglasovaniia-sdelok.html": 1.5,
-    "processy-lizingovoi-sdelki.html": 1.3,
-    "izmeneniia-v-dogovor.html": 1.2,
-    "soglasie-na-obrabotku-personalnyx-dannyx-sopd.html": 1.0,
-}
-
-# ==================== ЛОГИРОВАНИЕ ====================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КЭШ ====================
-class TTLCache:
-    def __init__(self, ttl_seconds: int):
-        self._cache: Dict[str, tuple] = {}
-        self._ttl = ttl_seconds
-        self._lock = asyncio.Lock()
-    
-    async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
-            if key in self._cache:
-                value, timestamp = self._cache[key]
-                if time.time() - timestamp < self._ttl:
-                    return value
-                del self._cache[key]
-        return None
-    
-    async def set(self, key: str, value: Any):
-        async with self._lock:
-            self._cache[key] = (value, time.time())
-    
-    async def clear(self):
-        async with self._lock:
-            self._cache.clear()
-    
-    def __len__(self):
-        return len(self._cache)
+# Groq клиент
+client = groq.Groq(api_key=GROQ_API_KEY)
 
-embedding_cache = TTLCache(CACHE_TTL_EMBEDDINGS)
-response_cache = TTLCache(CACHE_TTL_RESPONSES)
+# Пути
+CHROMA_PATH = "/app/data/chroma_db"
+DOCS_DIR = "/app/data/docs"
+os.makedirs(DOCS_DIR, exist_ok=True)
+os.makedirs(CHROMA_PATH, exist_ok=True)
 
-# ==================== RETRY ====================
-def retry_api(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            last_exc = None
-            for attempt in range(max_attempts):
-                try:
-                    return await func(*args, **kwargs)
-                except requests.exceptions.RequestException as e:
-                    last_exc = e
-                    wait = delay * (backoff ** attempt)
-                    logger.warning(f"{func.__name__} failed (#{attempt+1}): {e}. Wait {wait:.1f}s")
-                    await asyncio.sleep(wait)
-                except Exception as e:
-                    logger.error(f"{func.__name__} unexpected: {e}")
-                    raise
-            raise last_exc
-        return wrapper
-    return decorator
+# ChromaDB — БЕЗ metadata параметров!
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_or_create_collection(name="docs")
 
-# ==================== PARSE HTML ====================
-def parse_html_with_structure(html_content: str, source_filename: str) -> List[Dict]:
-    soup = BeautifulSoup(html_content, "lxml")
-    
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    
-    chunks = []
-    current_header = ""
-    
-    if source_filename == "processy-lizingovoi-sdelki.html":
-        for table in soup.find_all("table"):
-            rows = []
-            for tr in table.find_all("tr"):
-                cells = [td.get_text(separator=" ", strip=True) for td in tr.find_all(["td", "th"])]
-                if cells and any(c.strip() for c in cells):
-                    rows.append(" | ".join(cells))
-            if rows:
-                table_text = "\n".join(rows)
-                chunks.append({
-                    "text": f"[ТАБЛИЦА ПРОЦЕССА] {current_header}\n{table_text}",
-                    "metadata": {
-                        "source": source_filename,
-                        "header": current_header,
-                        "type": "process_table",
-                        "priority": SOURCE_PRIORITY.get(source_filename, 1.0),
-                    },
-                })
-    
-    for element in soup.find_all(["h1", "h2", "h3", "p", "table", "ul", "ol", "li"]):
-        text = element.get_text(separator=" ", strip=True)
-        if not text or len(text) < 20:
-            continue
-        
-        if element.name in ["h1", "h2", "h3"]:
-            current_header = text
-        elif element.name == "table" and source_filename != "processy-lizingovoi-sdelki.html":
-            table_text = element.get_text(separator=" | ", strip=True)
-            if len(table_text) < 2000:
-                chunks.append({
-                    "text": f"[Таблица] {current_header}: {table_text}",
-                    "metadata": {
-                        "source": source_filename,
-                        "header": current_header,
-                        "type": "table",
-                        "priority": SOURCE_PRIORITY.get(source_filename, 1.0),
-                    },
-                })
-        else:
-            chunk_text = f"{current_header}: {text}" if current_header else text
-            chunks.append({
-                "text": chunk_text,
-                "metadata": {
-                    "source": source_filename,
-                    "header": current_header,
-                    "type": "text",
-                    "priority": SOURCE_PRIORITY.get(source_filename, 1.0),
-                },
-            })
-    
-    return chunks
+# Настройки
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+MAX_CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+MAX_SEARCH_RESULTS = 5
 
-def smart_chunk_texts(chunks: List[Dict], max_size: int = MAX_CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:
-    result = []
-    for chunk in chunks:
-        text = chunk["text"]
-        if len(text) <= max_size:
-            result.append(chunk)
-        else:
-            sentences = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
-            current = ""
-            for i, sent in enumerate(sentences):
-                sentence = sent + "."
-                if len(current) + len(sentence) <= max_size:
-                    current += (" " if current else "") + sentence
-                else:
-                    if current:
-                        result.append({**chunk, "text": current})
-                    if overlap > 0 and i > 0:
-                        prev = sentences[max(0, i-3):i]
-                        current = ". ".join(prev) + ". " + sentence
-                    else:
-                        current = sentence
-            if current:
-                result.append({**chunk, "text": current})
-    return result
+# Кэш ответов (TTL 24 часа)
+response_cache = {}
+CACHE_TTL = 86400
 
-# ==================== EMBEDDINGS ====================
-@retry_api(max_attempts=3, delay=1.5, backoff=2.0)
-async def get_embedding(text: str) -> List[float]:
-    cache_key = hashlib.md5(text.encode("utf-8")).hexdigest()
-    cached = await embedding_cache.get(cache_key)
-    if cached is not None:
-        return cached
-    
-    url = f"https://router.huggingface.co/hf-inference/models/{EMBEDDING_MODEL}/pipeline/feature-extraction"
+# История диалогов
+user_history = {}
+
+# ==================== ЭМБЕДДИНГИ ====================
+def get_embedding(text: str):
+    """Получает эмбеддинг через HuggingFace API"""
+    url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
     payload = {
-        "inputs": text,
-        "options": {"wait_for_model": True, "use_cache": True},
+        "inputs": [text],
+        "options": {"wait_for_model": True}
     }
-    
     try:
-        response = await asyncio.to_thread(
-            requests.post, url, headers=headers, json=payload, timeout=30
-        )
-        response.raise_for_status()
-        embedding = response.json()
-        
-        if isinstance(embedding, list) and embedding and isinstance(embedding[0], list):
-            embedding = embedding[0]
-        
-        await embedding_cache.set(cache_key, embedding)
-        return embedding
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            logger.warning("HF rate limit. Waiting 60s...")
-            await asyncio.sleep(60)
-            return await get_embedding(text)
-        raise
-
-# ==================== CHROMADB С ИСПРАВЛЕНИЯМИ ====================
-_collection = None
-
-import chromadb
-from chromadb.config import Settings
-import os
-
-def init_chroma(force_recreate=False):
-    # Путь к данным: используем DATA_DIR из окружения
-    data_dir = os.getenv("DATA_DIR", "/app/data")
-    chroma_client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory=data_dir,
-    ))
-
-    collection_name = "leasing_docs_v2"
-
-    if force_recreate:
-        try:
-            chroma_client.delete_collection(collection_name)
-            print(f"✅ Удалена существующая коллекция {collection_name}")
-        except Exception as e:
-            # Если коллекции нет, просто проигнорируем
-            print(f"⚠️ Коллекция {collection_name} не найдена для удаления: {e}")
-
-    # Пытаемся получить или создать коллекцию
-    try:
-        # Допустимые метаданные для ChromaDB 0.5.23
-        collection = chroma_client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # только разрешённые параметры
-        )
-        print(f"✅ Коллекция {collection_name} готова")
-        return collection
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()[0]
     except Exception as e:
-        # Если не удалось создать/получить коллекцию – возможно, данные повреждены
-        print(f"❌ Ошибка при работе с коллекцией: {e}")
-        # Пробуем принудительно удалить и создать заново
-        try:
-            chroma_client.delete_collection(collection_name)
-        except:
-            pass
-        # Создаём заново без метаданных (с настройками по умолчанию)
-        collection = chroma_client.create_collection(collection_name)
-        print(f"✅ Коллекция {collection_name} создана заново (с настройками по умолчанию)")
-        return collection
+        logger.exception(f"Ошибка эмбеддинга: {e}")
+        return None
 
-def index_documents(collection: chromadb.Collection, docs_dir: Path = DOCS_DIR):
-    """Индексация документов"""
-    if not docs_dir.exists():
-        docs_dir.mkdir(parents=True, exist_ok=True)
-        logger.warning(f"Created docs directory: {docs_dir}")
-        return
-    
-    html_files = list(docs_dir.glob("*.html"))
-    logger.info(f"Found {len(html_files)} HTML files")
-    
-    if not html_files:
-        logger.warning("No HTML files in docs directory")
-        return
-    
-    all_chunks, all_ids, all_metas = [], [], []
-    
-    for file_path in html_files:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                html = f.read()
-            
-            chunks = parse_html_with_structure(html, file_path.name)
-            chunks = smart_chunk_texts(chunks)
-            
-            for i, chunk in enumerate(chunks):
-                chunk_id = f"{file_path.stem}_{i}_{hashlib.md5(chunk['text'][:100].encode()).hexdigest()[:8]}"
-                all_chunks.append(chunk["text"])
-                all_ids.append(chunk_id)
-                all_metas.append(chunk["metadata"])
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-            continue
-    
-    if not all_chunks:
-        logger.warning("No chunks to index")
-        return
-    
-    batch_size = 100
-    for i in range(0, len(all_chunks), batch_size):
-        batch_chunks = all_chunks[i:i+batch_size]
-        batch_ids = all_ids[i:i+batch_size]
-        batch_metas = all_metas[i:i+batch_size]
+# ==================== ПАРАСИНГ HTML ====================
+def extract_text_from_html(html_path):
+    """Извлекает текст из HTML с сохранением структуры"""
+    try:
+        with open(html_path, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f, 'html.parser')
         
+        # Удаляем ненужные элементы
+        for tag in soup(['script', 'style', 'comment']):
+            tag.decompose()
+        
+        # Особая обработка таблиц из processy-lizingovoi-sdelki.html
+        if 'processy-lizingovoi-sdelki' in html_path:
+            tables_text = []
+            for table in soup.find_all('table'):
+                rows = []
+                for tr in table.find_all('tr'):
+                    cells = [td.get_text(separator=' ', strip=True) for td in tr.find_all(['td', 'th'])]
+                    if cells and any(c.strip() for c in cells):
+                        rows.append(' | '.join(cells))
+                if rows:
+                    tables_text.append('\n'.join(rows))
+            if tables_text:
+                return '[ТАБЛИЦА ПРОЦЕССА]\n' + '\n\n'.join(tables_text)
+        
+        text = soup.get_text(separator='\n')
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return '\n'.join(lines)
+    except Exception as e:
+        logger.error(f"Ошибка парсинга {html_path}: {e}")
+        return None
+
+# ==================== ИНДЕКСАЦИЯ ====================
+def index_documents():
+    """Индексирует HTML-документы в ChromaDB"""
+    files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
+    if not files:
+        logger.warning(f"В {DOCS_DIR} нет HTML-файлов")
+        return
+    
+    logger.info(f"Найдено {len(files)} файлов. Начинаем индексацию...")
+    
+    for file_path in files:
+        text = extract_text_from_html(file_path)
+        if not text:
+            continue
+        
+        # Разбиение на чанки
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + MAX_CHUNK_SIZE, len(text))
+            chunks.append(text[start:end])
+            start += MAX_CHUNK_SIZE - CHUNK_OVERLAP
+        
+        # Эмбеддинги
         embeddings = []
-        for text in batch_chunks:
-            emb = asyncio.run(get_embedding(text))
+        for chunk in chunks:
+            emb = get_embedding(chunk)
+            if emb is None:
+                logger.error(f"Не удалось получить эмбеддинг для {file_path}")
+                continue
             embeddings.append(emb)
         
-        collection.add(ids=batch_ids, documents=batch_chunks, metadatas=batch_metas, embeddings=embeddings)
-        logger.info(f"Indexed {min(i+batch_size, len(all_chunks))}/{len(all_chunks)} chunks")
-    
-    logger.info(f"Indexing complete: {len(all_chunks)} chunks")
-
-# ==================== ПОИСК ====================
-def query_with_priority(collection: chromadb.Collection, query_embedding: List[float], 
-                       user_query: str, n_results: int = MAX_SEARCH_RESULTS) -> Dict:
-    try:
-        raw = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results * 2,
-            include=["documents", "metadatas", "distances"],
+        if not embeddings:
+            continue
+        
+        file_name = os.path.basename(file_path)
+        ids = [f"{file_name}_{i}" for i in range(len(chunks))]
+        metadatas = [{"source": file_name} for _ in chunks]
+        
+        collection.add(
+            embeddings=embeddings,
+            documents=chunks,
+            metadatas=metadatas,
+            ids=ids
         )
-        
-        if not raw["documents"][0]:
-            return raw
-        
-        scored = []
-        for doc, meta, dist in zip(raw["documents"][0], raw["metadatas"][0], raw["distances"][0]):
-            priority = meta.get("priority", 1.0)
-            score = (1 - dist) * priority
-            scored.append((score, doc, meta, dist))
-        
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:n_results]
-        
-        return {
-            "documents": [[item[1] for item in top]],
-            "metadatas": [[item[2] for item in top]],
-            "distances": [[item[3] for item in top]],
-        }
-    except Exception as e:
-        logger.error(f"Query error: {e}")
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
-
-# ==================== GROQ ====================
-@retry_api(max_attempts=3, delay=1.0, backoff=2.0)
-async def call_groq(prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> str:
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+        logger.info(f"Индексирован {file_name}: {len(chunks)} чанков")
     
-    if len(prompt) > MAX_PROMPT_TOKENS * 4:
-        prompt = prompt[:MAX_PROMPT_TOKENS * 4] + "\n\n[...обрезано...]"
-        logger.warning("Prompt truncated")
-    
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "top_p": 1.0,
-    }
-    
-    response = await asyncio.to_thread(
-        requests.post, url, headers=headers, json=payload, timeout=60
-    )
-    response.raise_for_status()
-    
-    return response.json()["choices"][0]["message"]["content"].strip()
+    logger.info(f"Индексация завершена. Всего записей: {collection.count()}")
 
-# ==================== ПРОМПТ ====================
-def build_prompt(context_chunks: List[str], user_query: str, history: str = "") -> str:
-    context_text = "\n\n---\n\n".join([
-        f"[Источник: {c.get('source', 'unknown')}] " + (c["text"] if isinstance(c, dict) else c)
-        for c in context_chunks
-    ])
-    
-    base = """Ты — эксперт лизинговой компании «ЛК ПроДвижение».
-Отвечай ТОЛЬКО на основе контекста из документации.
-
-ПРАВИЛА:
-1. Есть информация → дай точный ответ с цифрами.
-2. Противоречия → укажи и приведи варианты.
-3. Нет информации → задай уточняющий вопрос.
-4. Числа выделяй **жирным**.
-5. Списки оформляй маркированными.
-6. Отвечай на русском, профессионально.
-
-Контекст:
-{context}
-
-{history}
-
-Вопрос: {question}
-
-Ответ:"""
-    
-    history_part = f"\nИстория:\n{history}\n" if history else ""
-    return base.format(context=context_text, history=history_part, question=user_query)
-
-# ==================== ПАМЯТЬ ====================
-user_conversations: Dict[int, List[Dict]] = {}
-
-def add_to_history(chat_id: int, role: str, content: str):
-    if chat_id not in user_conversations:
-        user_conversations[chat_id] = []
-    history = user_conversations[chat_id]
-    history.append({"role": role, "content": content, "ts": time.time()})
-    if len(history) > MAX_HISTORY_MESSAGES * 2:
-        user_conversations[chat_id] = history[-MAX_HISTORY_MESSAGES * 2:]
-
-def get_history(chat_id: int) -> str:
-    history = user_conversations.get(chat_id, [])
-    if not history:
-        return ""
-    msgs = [f"{m['role']}: {m['content']}" for m in history[:-1]]
-    return "\n".join(msgs[-MAX_HISTORY_MESSAGES:])
-
-# ==================== ОБРАБОТЧИКИ ====================
+# ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
@@ -487,8 +194,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_conversations[chat_id] = []
-    await response_cache.clear()
+    if chat_id in user_history:
+        del user_history[chat_id]
     await update.message.reply_text("🗑️ История очищена.")
 
 async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -498,18 +205,18 @@ async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text("🔄 Переиндексация...")
     try:
-        global _collection
-        client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except:
-            pass
-        _collection = None
-        collection = init_chroma(force_recreate=True)
-        index_documents(collection)
-        await embedding_cache.clear()
-        await response_cache.clear()
-        await msg.edit_text("✅ Готово! Кэши очищены.")
+        # Очищаем коллекцию
+        chroma_client.delete_collection(name="docs")
+        global collection
+        collection = chroma_client.get_or_create_collection(name="docs")
+        
+        # Индексируем заново
+        index_documents()
+        
+        # Очищаем кэш
+        response_cache.clear()
+        
+        await msg.edit_text("✅ Готово! Документы переиндексированы.")
     except Exception as e:
         logger.error(f"Reindex error: {e}")
         await msg.edit_text(f"❌ Ошибка: {e}")
@@ -519,102 +226,138 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Доступ только администратору.")
         return
     
-    total_users = len(user_conversations)
-    total_msgs = sum(len(h) for h in user_conversations.values())
-    
     await update.message.reply_text(
         f"📊 Статистика:\n"
-        f"• Диалогов: {total_users}\n"
-        f"• Сообщений: {total_msgs}\n"
-        f"• Кэш эмбеддингов: {len(embedding_cache)}\n"
+        f"• Записей в базе: {collection.count()}\n"
+        f"• Активных диалогов: {len(user_history)}\n"
         f"• Кэш ответов: {len(response_cache)}\n"
-        f"• Модель: {GROQ_MODEL}\n"
-        f"• Эмбеддинги: {EMBEDDING_MODEL.split('/')[-1]}"
+        f"• Модель: {GROQ_MODEL}"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
-    text = update.message.text.strip()
+    user_text = update.message.text.strip()
     
-    if not text:
+    if not user_text:
         return
     
-    logger.info(f"User {user.id}: {text[:100]}...")
-    add_to_history(chat_id, "user", text)
+    logger.info(f"User {user.id}: {user_text[:100]}...")
     
+    # Показываем "печатает..."
     await update.message.chat.send_action(constants.ChatAction.TYPING)
     
-    cache_key = f"resp:{chat_id}:{hashlib.md5(text.encode()).hexdigest()}"
-    cached = await response_cache.get(cache_key)
-    if cached:
-        await update.message.reply_text(cached)
-        add_to_history(chat_id, "assistant", cached)
+    # Кэш ответов
+    cache_key = f"{chat_id}:{hashlib.md5(user_text.encode()).hexdigest()}"
+    current_time = time.time()
+    
+    # Проверяем кэш (TTL 24 часа)
+    if cache_key in response_cache:
+        cached_answer, cached_time = response_cache[cache_key]
+        if current_time - cached_time < CACHE_TTL:
+            logger.info(f"Cache HIT for chat {chat_id}")
+            await update.message.reply_text(cached_answer)
+            return
+        else:
+            del response_cache[cache_key]
+    
+    # Эмбеддинг запроса
+    query_embedding = get_embedding(user_text)
+    if query_embedding is None:
+        await update.message.reply_text("❌ Ошибка при обращении к сервису эмбеддингов. Попробуйте позже.")
         return
     
-    try:
-        collection = init_chroma()
-        query_emb = await get_embedding(text)
-        results = query_with_priority(collection, query_emb, text)
-        
-        if not results["documents"][0]:
-            fallback = (
-                "❓ Не нашёл точной информации.\n"
-                "Уточните:\n"
-                "• Тип клиента (ИП/ЮЛ)?\n"
-                "• Выручка?\n"
-                "• Тип предмета лизинга?\n"
-                "• Конкретный параметр?"
-            )
-            await update.message.reply_text(fallback)
-            add_to_history(chat_id, "assistant", fallback)
-            return
-        
-        context_chunks = results["documents"][0]
-        history = get_history(chat_id)
-        prompt = build_prompt(context_chunks, text, history)
-        
-        start_time = time.time()
-        answer = await call_groq(prompt)
-        logger.info(f"Groq: {time.time()-start_time:.2f}s, {len(answer)} chars")
-        
-        await response_cache.set(cache_key, answer)
-        await update.message.reply_text(answer)
-        add_to_history(chat_id, "assistant", answer)
-        
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await update.message.reply_text(
-            "⚠️ Ошибка обработки.\n"
-            "Попробуйте ещё раз или напишите администратору.\n"
-            f"(Детали: {str(e)[:100]})"
+    # Поиск в базе
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=MAX_SEARCH_RESULTS,
+        include=["documents", "metadatas"]
+    )
+    
+    if not results['documents'][0]:
+        fallback = (
+            "❓ Не нашёл точной информации.\n"
+            "Уточните:\n"
+            "• Тип клиента (ИП/ЮЛ)?\n"
+            "• Выручка?\n"
+            "• Тип предмета лизинга?\n"
+            "• Конкретный параметр?"
         )
-
-# ==================== ЗАПУСК ====================
-def main():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        await update.message.reply_text(fallback)
+        return
     
-    logger.info("Initializing ChromaDB...")
+    # Формируем контекст
+    context_chunks = results['documents'][0]
+    sources = list(set(meta['source'] for meta in results['metadatas'][0]))
+    context_text = "\n\n---\n\n".join(context_chunks)
+    
+    # История диалога (последние 3 сообщения)
+    history = user_history.get(chat_id, [])[-6:]  # 3 пары вопрос-ответ
+    history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history]) if history else ""
+    
+    # Промпт
+    prompt = (
+        "Ты — эксперт лизинговой компании «ЛК ПроДвижение».\n"
+        "Отвечай ТОЛЬКО на основе контекста из документации.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Есть информация → дай точный ответ с цифрами.\n"
+        "2. Противоречия → укажи и приведи варианты.\n"
+        "3. Нет информации → задай уточняющий вопрос.\n"
+        "4. Числа выделяй **жирным**.\n"
+        "5. Списки оформляй маркированными.\n"
+        "6. Отвечай на русском, профессионально.\n\n"
+        f"Контекст:\n{context_text}\n\n"
+        f"{('История:\n' + history_text + '\n\n') if history_text else ''}"
+        f"Вопрос: {user_text}\n\n"
+        "Ответ:"
+    )
+    
+    # Groq API
     try:
-        collection = init_chroma()
-        if collection.count() == 0:
-            logger.info("First run: indexing documents...")
-            index_documents(collection)
-        else:
-            logger.info(f"ChromaDB ready with {collection.count()} documents")
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1024
+        )
+        answer = completion.choices[0].message.content
+        
+        # Сохраняем в кэш
+        response_cache[cache_key] = (answer, current_time)
+        
+        # Сохраняем в историю
+        if chat_id not in user_history:
+            user_history[chat_id] = []
+        user_history[chat_id].append({"role": "user", "content": user_text})
+        user_history[chat_id].append({"role": "assistant", "content": answer})
+        if len(user_history[chat_id]) > 10:
+            user_history[chat_id] = user_history[chat_id][-10:]
+        
+        # Источники
+        source_line = f"\n\n📄 Источники: {', '.join(sources)}"
+        final_answer = answer + source_line
+        
+        await update.message.reply_text(final_answer)
+        
     except Exception as e:
-        logger.error(f"Failed to initialize ChromaDB: {e}")
-        logger.info("Trying to recreate...")
-        try:
-            collection = init_chroma(force_recreate=True)
-            index_documents(collection)
-        except Exception as e2:
-            logger.error(f"Critical error: {e2}")
-            raise
+        logger.exception(f"Ошибка Groq: {e}")
+        await update.message.reply_text("❌ Ошибка при обращении к Groq. Попробуйте позже.")
+
+def main():
+    """Точка входа"""
+    logger.info("Запуск бота...")
     
+    # Индексация при первом запуске
+    if collection.count() == 0:
+        logger.info("Коллекция пуста, запускаем индексацию...")
+        index_documents()
+    else:
+        logger.info(f"Коллекция содержит {collection.count()} записей")
+    
+    # Приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
+    # Обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear_history))
@@ -625,7 +368,7 @@ def main():
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("Bot starting...")
+    logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":

@@ -1,18 +1,6 @@
-# Telegram Bot API
-python-telegram-bot==21.0
-
-# Векторная база данных (совместима с NumPy 1.26.4)
-chromadb==0.5.23
-
-# HTTP-клиенты
-requests==2.32.3
-
-# Парсинг HTML
+python-telegram-bot==20.7
+groq==0.9.0
+chromadb==0.4.22
 beautifulsoup4==4.12.3
-lxml==5.3.0
-
-# Groq API
-groq==0.13.0
-
-# Утилиты
-aiofiles==24.1.0
+requests==2.33.0
+numpy==1.26.4
