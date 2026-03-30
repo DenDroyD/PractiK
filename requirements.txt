@@ -1,7 +1,7 @@
 # Telegram Bot API
 python-telegram-bot==21.0
 
-# Векторная база данных (совместима с NumPy 1.26.4)
+# Векторная база данных
 chromadb==0.5.23
 
 # HTTP-клиенты
@@ -16,3 +16,8 @@ groq==0.13.0
 
 # Утилиты
 aiofiles==24.1.0
+python-dotenv==1.0.0
+
+# Для обработки текста и BM25
+langchain>=0.1.0
+rank-bm25>=0.2.2
