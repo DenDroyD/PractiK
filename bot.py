@@ -1,29 +1,28 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Telegram RAG-бот для ЛК ПроДвижение
-Версия: 1.1 (исправленная)
-Совместимость: chromadb==0.4.22, numpy==1.26.4
-"""
-
 import os
 import logging
 import glob
-import hashlib
-import time
 import asyncio
-from telegram import Update, constants
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import time
+import requests
+import shutil
+from functools import lru_cache
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import telegram
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import groq
 import chromadb
-from bs4 import BeautifulSoup
-import requests
+from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from rank_bm25 import BM25Okapi
 
-# ==================== КОНФИГУРАЦИЯ ====================
+# --- Конфигурация ---
+load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "477810377"))
+# Используем ADMIN_USER_ID, если задан, иначе ADMIN_ID для обратной совместимости
+ADMIN_ID = int(os.getenv("ADMIN_USER_ID", os.getenv("ADMIN_ID", 0)))
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -34,342 +33,353 @@ if not HF_TOKEN:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Groq клиент
-client = groq.Groq(api_key=GROQ_API_KEY)
+# --- Инициализация Groq ---
+groq_client = groq.Groq(api_key=GROQ_API_KEY)
 
-# Пути
-CHROMA_PATH = "/app/data/chroma_db"
-DOCS_DIR = "/app/data/docs"
+# --- Настройки путей ---
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")      # основная папка для данных
+CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")  # где хранится ChromaDB
+DOCS_DIR = os.path.join(DATA_DIR, "docs")          # где лежат исходные HTML-файлы
 os.makedirs(DOCS_DIR, exist_ok=True)
-os.makedirs(CHROMA_PATH, exist_ok=True)
 
-# ChromaDB — БЕЗ metadata параметров!
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection = chroma_client.get_or_create_collection(name="docs")
+# --- Инициализация ChromaDB с возможностью force_recreate ---
+def init_chroma(force_recreate=False):
+    """
+    Инициализирует постоянный клиент ChromaDB.
+    При force_recreate=True удаляет всю папку данных и создаёт коллекцию заново.
+    """
+    if force_recreate and os.path.exists(CHROMA_PATH):
+        try:
+            shutil.rmtree(CHROMA_PATH)
+            logger.info(f"🧹 Папка {CHROMA_PATH} удалена для чистой инициализации")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить {CHROMA_PATH}: {e}")
 
-# Настройки
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-MAX_CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-MAX_SEARCH_RESULTS = 5
+    os.makedirs(CHROMA_PATH, exist_ok=True)
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection_name = "leasing_docs_v2"
 
-# Кэш ответов (TTL 24 часа)
-response_cache = {}
-CACHE_TTL = 86400
+    if force_recreate:
+        try:
+            client.delete_collection(collection_name)
+            logger.info(f"✅ Коллекция {collection_name} удалена")
+        except Exception:
+            pass
 
-# История диалогов
-user_history = {}
-
-# ==================== ЭМБЕДДИНГИ ====================
-def get_embedding(text: str):
-    """Получает эмбеддинг через HuggingFace API"""
-    url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "inputs": [text],
-        "options": {"wait_for_model": True}
-    }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json()[0]
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}  # допустимые метаданные
+        )
+        logger.info(f"✅ Коллекция {collection_name} готова")
+        return collection
     except Exception as e:
-        logger.exception(f"Ошибка эмбеддинга: {e}")
-        return None
+        logger.error(f"Ошибка при работе с коллекцией: {e}")
+        try:
+            client.delete_collection(collection_name)
+        except:
+            pass
+        collection = client.create_collection(collection_name)
+        logger.info(f"✅ Коллекция {collection_name} создана заново (с настройками по умолчанию)")
+        return collection
 
-# ==================== ПАРАСИНГ HTML ====================
+# Глобальная коллекция и клиент
+chroma_client = None
+collection = None
+
+# --- Глобальные переменные для BM25 ---
+corpus = []          # список всех чанков (текстов)
+bm25 = None          # объект BM25Okapi
+tokenized_corpus = []  # токенизированная версия
+
+# --- Настройки поиска ---
+TOP_K_VECTOR = 10    # сколько чанков брать из векторного поиска
+TOP_K_FINAL = 5      # сколько оставить после гибридного ранжирования
+ALPHA = 0.6          # вес векторного поиска (1 - ALPHA вес BM25)
+
+# --- Разбиение текста на чанки ---
+headers_to_split_on = [
+    ("#", "H1"),
+    ("##", "H2"),
+    ("###", "H3"),
+]
+md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on)
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    separators=["\n\n", "\n", ".", " ", ""]
+)
+
 def extract_text_from_html(html_path):
-    """Извлекает текст из HTML с сохранением структуры"""
-    try:
-        with open(html_path, 'r', encoding='utf-8') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-        
-        # Удаляем ненужные элементы
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'html.parser')
         for tag in soup(['script', 'style', 'comment']):
             tag.decompose()
-        
-        # Особая обработка таблиц из processy-lizingovoi-sdelki.html
-        if 'processy-lizingovoi-sdelki' in html_path:
-            tables_text = []
-            for table in soup.find_all('table'):
-                rows = []
-                for tr in table.find_all('tr'):
-                    cells = [td.get_text(separator=' ', strip=True) for td in tr.find_all(['td', 'th'])]
-                    if cells and any(c.strip() for c in cells):
-                        rows.append(' | '.join(cells))
-                if rows:
-                    tables_text.append('\n'.join(rows))
-            if tables_text:
-                return '[ТАБЛИЦА ПРОЦЕССА]\n' + '\n\n'.join(tables_text)
-        
         text = soup.get_text(separator='\n')
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return '\n'.join(lines)
+
+def chunk_text(text):
+    if any(h in text for h in ["#", "##", "###"]):
+        try:
+            docs = md_splitter.split_text(text)
+            chunks = []
+            for doc in docs:
+                header = doc.metadata.get("H1") or doc.metadata.get("H2") or doc.metadata.get("H3")
+                full = f"{header}\n{doc.page_content}" if header else doc.page_content
+                chunks.append(full)
+            return chunks
+        except Exception:
+            return text_splitter.split_text(text)
+    else:
+        return text_splitter.split_text(text)
+
+@lru_cache(maxsize=100)
+def get_embedding(text: str):
+    """Получение эмбеддинга через HF Inference API с кэшированием."""
+    url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+    payload = {"inputs": [text], "options": {"wait_for_model": True}}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()[0]   # список float
     except Exception as e:
-        logger.error(f"Ошибка парсинга {html_path}: {e}")
+        logger.exception("Ошибка получения эмбеддинга от Hugging Face")
         return None
 
-# ==================== ИНДЕКСАЦИЯ ====================
+def update_bm25():
+    """Обновляет BM25-индекс на основе глобального corpus."""
+    global bm25, tokenized_corpus
+    if not corpus:
+        bm25 = None
+        tokenized_corpus = []
+        return
+    tokenized_corpus = [doc.split() for doc in corpus]
+    bm25 = BM25Okapi(tokenized_corpus)
+
 def index_documents():
-    """Индексирует HTML-документы в ChromaDB"""
+    """Индексирует все HTML-файлы в DOCS_DIR."""
+    global corpus, collection
     files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
     if not files:
         logger.warning(f"В {DOCS_DIR} нет HTML-файлов")
         return
-    
+
     logger.info(f"Найдено {len(files)} файлов. Начинаем индексацию...")
-    
+    all_chunks = []
+    all_embeddings = []
+    all_ids = []
+    all_metadatas = []
     for file_path in files:
         text = extract_text_from_html(file_path)
         if not text:
             continue
-        
-        # Разбиение на чанки
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = min(start + MAX_CHUNK_SIZE, len(text))
-            chunks.append(text[start:end])
-            start += MAX_CHUNK_SIZE - CHUNK_OVERLAP
-        
-        # Эмбеддинги
+        chunks = chunk_text(text)
+        if not chunks:
+            continue
+
         embeddings = []
         for chunk in chunks:
             emb = get_embedding(chunk)
             if emb is None:
-                logger.error(f"Не удалось получить эмбеддинг для {file_path}")
-                continue
+                logger.error(f"Не удалось получить эмбеддинг для {file_path}, пропускаем")
+                return
             embeddings.append(emb)
-        
-        if not embeddings:
-            continue
-        
+
         file_name = os.path.basename(file_path)
         ids = [f"{file_name}_{i}" for i in range(len(chunks))]
         metadatas = [{"source": file_name} for _ in chunks]
-        
-        collection.add(
-            embeddings=embeddings,
-            documents=chunks,
-            metadatas=metadatas,
-            ids=ids
-        )
+
+        all_chunks.extend(chunks)
+        all_embeddings.extend(embeddings)
+        all_ids.extend(ids)
+        all_metadatas.extend(metadatas)
         logger.info(f"Индексирован {file_name}: {len(chunks)} чанков")
-    
-    logger.info(f"Индексация завершена. Всего записей: {collection.count()}")
 
-# ==================== ОБРАБОТЧИКИ TELEGRAM ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"Здравствуйте, {user.first_name}! 👋\n\n"
-        "Я — бот-помощник ЛК ПроДвижение.\n"
-        "Отвечаю на вопросы по:\n"
-        "• Условиям лизинга и лимитам\n"
-        "• Процессам оформления сделок\n"
-        "• Документам и требованиям\n"
-        "• Изменениям в договорах\n\n"
-        "Напишите вопрос — я найду ответ в базе. 📚"
-    )
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📋 Команды:\n"
-        "/start — начать\n"
-        "/help — справка\n"
-        "/reindex — [админ] переиндексировать документы\n"
-        "/stats — [админ] статистика\n"
-        "/clear — очистить историю\n\n"
-        "💡 Советы:\n"
-        "• Задавайте конкретные вопросы\n"
-        "• Указывайте тип клиента (ИП/ЮЛ) и выручку"
-    )
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in user_history:
-        del user_history[chat_id]
-    await update.message.reply_text("🗑️ История очищена.")
-
-async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Доступ только администратору.")
+    if not all_chunks:
         return
-    
-    msg = await update.message.reply_text("🔄 Переиндексация...")
+
+    # Очищаем коллекцию и добавляем новые данные
     try:
-        # Очищаем коллекцию
-        chroma_client.delete_collection(name="docs")
-        global collection
-        collection = chroma_client.get_or_create_collection(name="docs")
-        
-        # Индексируем заново
+        chroma_client.delete_collection(collection.name)
+        collection = chroma_client.create_collection(collection.name)
+    except Exception:
+        pass
+    collection.add(
+        embeddings=all_embeddings,
+        documents=all_chunks,
+        metadatas=all_metadatas,
+        ids=all_ids
+    )
+    corpus = all_chunks
+    update_bm25()
+    logger.info(f"Индексация завершена. Всего чанков: {len(all_chunks)}")
+
+# --- Память диалога ---
+user_histories = {}  # chat_id -> список кортежей (role, text)
+
+# --- Обработчики команд ---
+async def start(update: Update, context):
+    await update.message.reply_text(
+        "Привет! Я RAG-бот. Задай вопрос по документации (лизинг, страховки, агенты, поставщики). "
+        "Я помню историю нашего разговора, могу уточнить детали."
+    )
+
+async def reindex(update: Update, context):
+    """Принудительная переиндексация (только для администратора)."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("У вас нет прав для этой команды.")
+        return
+    await update.message.reply_text("Начинаю переиндексацию...")
+    try:
         index_documents()
-        
-        # Очищаем кэш
-        response_cache.clear()
-        
-        await msg.edit_text("✅ Готово! Документы переиндексированы.")
+        await update.message.reply_text("Переиндексация завершена.")
     except Exception as e:
-        logger.error(f"Reindex error: {e}")
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        logger.exception("Ошибка при переиндексации")
+        await update.message.reply_text(f"Ошибка: {e}")
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("❌ Доступ только администратору.")
-        return
-    
-    await update.message.reply_text(
-        f"📊 Статистика:\n"
-        f"• Записей в базе: {collection.count()}\n"
-        f"• Активных диалогов: {len(user_history)}\n"
-        f"• Кэш ответов: {len(response_cache)}\n"
-        f"• Модель: {GROQ_MODEL}"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    user_text = update.message.text.strip()
-    
-    if not user_text:
-        return
-    
-    logger.info(f"User {user.id}: {user_text[:100]}...")
-    
-    # Показываем "печатает..."
-    await update.message.chat.send_action(constants.ChatAction.TYPING)
-    
-    # Кэш ответов
-    cache_key = f"{chat_id}:{hashlib.md5(user_text.encode()).hexdigest()}"
-    current_time = time.time()
-    
-    # Проверяем кэш (TTL 24 часа)
-    if cache_key in response_cache:
-        cached_answer, cached_time = response_cache[cache_key]
-        if current_time - cached_time < CACHE_TTL:
-            logger.info(f"Cache HIT for chat {chat_id}")
-            await update.message.reply_text(cached_answer)
-            return
-        else:
-            del response_cache[cache_key]
-    
-    # Эмбеддинг запроса
-    query_embedding = get_embedding(user_text)
+def hybrid_search(query: str):
+    """Выполняет гибридный поиск: векторный + BM25."""
+    query_embedding = get_embedding(query)
     if query_embedding is None:
-        await update.message.reply_text("❌ Ошибка при обращении к сервису эмбеддингов. Попробуйте позже.")
-        return
-    
-    # Поиск в базе
-    results = collection.query(
+        logger.warning("Не удалось получить эмбеддинг запроса")
+        return []
+
+    vector_results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=MAX_SEARCH_RESULTS,
-        include=["documents", "metadatas"]
+        n_results=TOP_K_VECTOR,
+        include=["documents", "metadatas", "distances"]
     )
-    
-    if not results['documents'][0]:
-        fallback = (
-            "❓ Не нашёл точной информации.\n"
-            "Уточните:\n"
-            "• Тип клиента (ИП/ЮЛ)?\n"
-            "• Выручка?\n"
-            "• Тип предмета лизинга?\n"
-            "• Конкретный параметр?"
-        )
-        await update.message.reply_text(fallback)
+    if not vector_results['documents'][0]:
+        return []
+
+    bm25_scores = {}
+    if bm25 and corpus:
+        tokenized_query = query.split()
+        scores = bm25.get_scores(tokenized_query)
+        text_to_score = {}
+        for i, doc in enumerate(corpus):
+            text_to_score[doc] = scores[i]
+    else:
+        text_to_score = {}
+
+    combined = []
+    for i, doc in enumerate(vector_results['documents'][0]):
+        similarity = 1 - vector_results['distances'][0][i]
+        bm25_score = text_to_score.get(doc, 0.0)
+        combined_score = ALPHA * similarity + (1 - ALPHA) * bm25_score
+        combined.append((combined_score, doc, vector_results['metadatas'][0][i]))
+
+    combined.sort(key=lambda x: x[0], reverse=True)
+    return combined[:TOP_K_FINAL]
+
+def call_groq_with_retry(messages, retries=3):
+    for i in range(retries):
+        try:
+            completion = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.2,
+                max_tokens=2048
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"Ошибка Groq, попытка {i+1}/{retries}: {e}")
+            if i == retries - 1:
+                raise
+            time.sleep(2 ** i)
+
+async def handle_message(update: Update, context):
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+    logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
+
+    history = user_histories.get(chat_id, [])
+    history.append(("user", user_text))
+    if len(history) > 10:
+        history = history[-10:]
+    user_histories[chat_id] = history
+
+    search_results = hybrid_search(user_text)
+    if not search_results:
+        await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
         return
-    
-    # Формируем контекст
-    context_chunks = results['documents'][0]
-    sources = list(set(meta['source'] for meta in results['metadatas'][0]))
-    context_text = "\n\n---\n\n".join(context_chunks)
-    
-    # История диалога (последние 3 сообщения)
-    history = user_history.get(chat_id, [])[-6:]  # 3 пары вопрос-ответ
-    history_text = "\n".join([f"{h['role']}: {h['content']}" for h in history]) if history else ""
-    
-    # Промпт
+
+    context_chunks = [res[1] for res in search_results]
+    sources = list(set(res[2]['source'] for res in search_results))
+    context_text = "\n\n".join(context_chunks)
+
+    history_str = ""
+    if len(history) > 1:
+        prev = history[:-1]
+        lines = []
+        for role, text in prev:
+            if role == "user":
+                lines.append(f"Пользователь: {text}")
+            else:
+                lines.append(f"Ассистент: {text}")
+        history_str = "\n".join(lines) + "\n"
+
     prompt = (
-        "Ты — эксперт лизинговой компании «ЛК ПроДвижение».\n"
-        "Отвечай ТОЛЬКО на основе контекста из документации.\n\n"
-        "ПРАВИЛА:\n"
-        "1. Есть информация → дай точный ответ с цифрами.\n"
-        "2. Противоречия → укажи и приведи варианты.\n"
-        "3. Нет информации → задай уточняющий вопрос.\n"
-        "4. Числа выделяй **жирным**.\n"
-        "5. Списки оформляй маркированными.\n"
-        "6. Отвечай на русском, профессионально.\n\n"
+        f"{history_str}"
+        f"Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст.\n"
+        f"Если в контексте есть информация, дай полный, точный и развёрнутый ответ.\n"
+        f"Если информация противоречива, сообщи об этом. Если ответ требует числовых данных, выдели их **жирным**.\n"
+        f"Если ответ можно представить списком, используй маркированный список.\n"
+        f"Если для ответа не хватает информации, задай уточняющий вопрос, а не выдумывай ответ.\n\n"
         f"Контекст:\n{context_text}\n\n"
-        f"{('История:\n' + history_text + '\n\n') if history_text else ''}"
         f"Вопрос: {user_text}\n\n"
-        "Ответ:"
+        f"Ответ:"
     )
-    
-    # Groq API
+
     try:
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1024
-        )
-        answer = completion.choices[0].message.content
-        
-        # Сохраняем в кэш
-        response_cache[cache_key] = (answer, current_time)
-        
-        # Сохраняем в историю
-        if chat_id not in user_history:
-            user_history[chat_id] = []
-        user_history[chat_id].append({"role": "user", "content": user_text})
-        user_history[chat_id].append({"role": "assistant", "content": answer})
-        if len(user_history[chat_id]) > 10:
-            user_history[chat_id] = user_history[chat_id][-10:]
-        
-        # Источники
-        source_line = f"\n\n📄 Источники: {', '.join(sources)}"
-        final_answer = answer + source_line
-        
-        await update.message.reply_text(final_answer)
-        
+        answer = call_groq_with_retry([{"role": "user", "content": prompt}])
     except Exception as e:
-        logger.exception(f"Ошибка Groq: {e}")
-        await update.message.reply_text("❌ Ошибка при обращении к Groq. Попробуйте позже.")
+        logger.exception("Ошибка Groq")
+        await update.message.reply_text("Произошла ошибка при генерации ответа. Попробуйте позже.")
+        return
+
+    if answer.startswith("Уточните") or answer.startswith("Уточни"):
+        await update.message.reply_text(answer)
+        return
+
+    history.append(("assistant", answer))
+    user_histories[chat_id] = history
+
+    source_line = f"\n\n📄 Источники: {', '.join(sources)}"
+    final_answer = answer + source_line
+    await update.message.reply_text(final_answer)
 
 def main():
-    """Точка входа"""
-    logger.info("Запуск бота...")
-    
-    # Индексация при первом запуске
+    global chroma_client, collection
+    # Инициализация ChromaDB (force_recreate=False при обычном запуске)
+    # Если нужно принудительно пересоздать базу, можно передать True, но по умолчанию False
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+    collection = init_chroma(force_recreate=False)
+
+    # Если коллекция пуста или нужно обновить индексы, запускаем индексацию
     if collection.count() == 0:
         logger.info("Коллекция пуста, запускаем индексацию...")
         index_documents()
     else:
-        logger.info(f"Коллекция содержит {collection.count()} записей")
-    
-    # Приложение
+        logger.info(f"Коллекция уже содержит {collection.count()} записей")
+        # Для BM25 загружаем чанки из коллекции
+        all_data = collection.get(include=["documents"])
+        global corpus
+        corpus = all_data.get('documents', [])
+        update_bm25()
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Обработчики
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("clear", clear_history))
-    
-    if ADMIN_USER_ID > 0:
-        app.add_handler(CommandHandler("reindex", reindex_cmd))
-        app.add_handler(CommandHandler("stats", stats_cmd))
-    
+    app.add_handler(CommandHandler("reindex", reindex))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("Бот запущен")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    logger.info("Бот запущен в режиме long polling")
+    app.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
