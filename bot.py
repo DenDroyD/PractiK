@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")   # Токен, который работает
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -23,36 +23,33 @@ if not HF_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Инициализация Groq ---
 client = groq.Groq(api_key=GROQ_API_KEY)
 
-# --- Инициализация ChromaDB ---
 CHROMA_PATH = "./chroma_db"
 DOCS_DIR = "/app/data/docs"
-
 os.makedirs(DOCS_DIR, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name="docs")
 
-# --- Получение эмбеддинга через Hugging Face (работающий URL) ---
+# --- Эмбеддинги через Hugging Face (мультиязычная модель) ---
 def get_embedding(text: str):
-    MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    url = f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}/pipeline/feature-extraction"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    url = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/pipeline/feature-extraction"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
     payload = {
-        "inputs": [text],  # важно: список
+        "inputs": [text],   # обязательно список!
         "options": {"wait_for_model": True}
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        # Ответ – список списков, берём первый элемент
-        return resp.json()[0]
+        return resp.json()[0]   # результат — список списков
     except Exception as e:
         logger.exception("Ошибка получения эмбеддинга от Hugging Face")
         return None
 
-# --- Парсинг HTML ---
 def extract_text_from_html(html_path):
     with open(html_path, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f, 'html.parser')
@@ -62,7 +59,6 @@ def extract_text_from_html(html_path):
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return '\n'.join(lines)
 
-# --- Индексация документов ---
 def index_documents():
     files = glob.glob(os.path.join(DOCS_DIR, "*.html"))
     if not files:
@@ -74,8 +70,6 @@ def index_documents():
         text = extract_text_from_html(file_path)
         if not text:
             continue
-
-        # Разбиваем на чанки
         chunk_size = 1000
         overlap = 200
         chunks = []
@@ -85,7 +79,6 @@ def index_documents():
             chunks.append(text[start:end])
             start += chunk_size - overlap
 
-        # Получаем эмбеддинги для всех чанков
         embeddings = []
         for chunk in chunks:
             emb = get_embedding(chunk)
@@ -106,18 +99,14 @@ def index_documents():
         )
         logger.info(f"Индексирован {file_name}: {len(chunks)} чанков")
 
-# При старте проверяем, есть ли данные в коллекции
 if collection.count() == 0:
     logger.info("Коллекция пуста, запускаем индексацию...")
     index_documents()
 else:
     logger.info(f"Коллекция уже содержит {collection.count()} записей")
 
-# --- Обработчики команд ---
 async def start(update: Update, context):
-    await update.message.reply_text(
-        "Привет! Я RAG-бот. Задай вопрос по документации (лизинг, страховки, агенты, поставщики)."
-    )
+    await update.message.reply_text("Привет! Я RAG-бот. Задай вопрос по документации (лизинг, страховки, агенты, поставщики).")
 
 async def handle_message(update: Update, context):
     user_text = update.message.text
@@ -130,7 +119,7 @@ async def handle_message(update: Update, context):
 
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=5,          # берём 5 чанков для более полного ответа
+        n_results=5,   # увеличили до 5
         include=["documents", "metadatas"]
     )
 
@@ -138,13 +127,20 @@ async def handle_message(update: Update, context):
         await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
         return
 
+    # Логирование найденных чанков для отладки
+    logger.info(f"Найдено {len(results['documents'][0])} чанков")
+    for i, doc in enumerate(results['documents'][0]):
+        src = results['metadatas'][0][i]['source']
+        logger.info(f"Чанк {i+1} (источник {src}): {doc[:300]}")
+
     context_chunks = results['documents'][0]
     sources = list(set(meta['source'] for meta in results['metadatas'][0]))
     context_text = "\n\n".join(context_chunks)
 
     prompt = (
-        "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
-        "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
+        "Ты — полезный помощник, который отвечает на вопросы, используя предоставленный контекст. "
+        "Если в контексте есть информация, дай полный и точный ответ, по возможности развёрнутый. "
+        "Если информации нет, скажи, что не знаешь, и предложи уточнить вопрос.\n\n"
         "Контекст:\n{context}\n\nВопрос: {question}\n\nОтвет:"
     ).format(context=context_text, question=user_text)
 
