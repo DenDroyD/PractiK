@@ -36,12 +36,20 @@ collection = chroma_client.get_or_create_collection(name="docs")
 
 # --- Получение эмбеддинга через Hugging Face Inference API ---
 def get_embedding(text: str):
-    url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": text,
+        "options": {"wait_for_model": True}
+    }
     try:
-        resp = requests.post(url, headers=headers, json={"inputs": text}, timeout=10)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        return resp.json()  # список float
+        # Ответ – список чисел (эмбеддинг)
+        return resp.json()
     except Exception as e:
         logger.exception("Ошибка получения эмбеддинга от Hugging Face")
         return None
