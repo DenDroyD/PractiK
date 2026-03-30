@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")   # Токен, который работает
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -28,28 +28,26 @@ client = groq.Groq(api_key=GROQ_API_KEY)
 
 # --- Инициализация ChromaDB ---
 CHROMA_PATH = "./chroma_db"
-DOCS_DIR = "/app/data/docs"   # папка с вашими HTML-файлами
+DOCS_DIR = "/app/data/docs"
 
 os.makedirs(DOCS_DIR, exist_ok=True)
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name="docs")
 
-# --- Получение эмбеддинга через Hugging Face Inference API ---
+# --- Получение эмбеддинга через Hugging Face (работающий URL) ---
 def get_embedding(text: str):
-    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    url = f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}/pipeline/feature-extraction"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {
-        "inputs": text,
+        "inputs": [text],  # важно: список
         "options": {"wait_for_model": True}
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        # Ответ – список чисел (эмбеддинг)
-        return resp.json()
+        # Ответ – список списков, берём первый элемент
+        return resp.json()[0]
     except Exception as e:
         logger.exception("Ошибка получения эмбеддинга от Hugging Face")
         return None
@@ -77,7 +75,7 @@ def index_documents():
         if not text:
             continue
 
-        # Разбиваем на чанки (простое разбиение по длине с перекрытием)
+        # Разбиваем на чанки
         chunk_size = 1000
         overlap = 200
         chunks = []
@@ -87,6 +85,7 @@ def index_documents():
             chunks.append(text[start:end])
             start += chunk_size - overlap
 
+        # Получаем эмбеддинги для всех чанков
         embeddings = []
         for chunk in chunks:
             emb = get_embedding(chunk)
@@ -124,16 +123,14 @@ async def handle_message(update: Update, context):
     user_text = update.message.text
     logger.info(f"Пользователь {update.effective_user.id}: {user_text}")
 
-    # 1. Эмбеддинг вопроса
     query_embedding = get_embedding(user_text)
     if query_embedding is None:
         await update.message.reply_text("Ошибка при обращении к сервису эмбеддингов. Попробуйте позже.")
         return
 
-    # 2. Поиск в ChromaDB
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=3,
+        n_results=5,          # берём 5 чанков для более полного ответа
         include=["documents", "metadatas"]
     )
 
@@ -141,19 +138,16 @@ async def handle_message(update: Update, context):
         await update.message.reply_text("Извините, не нашёл информации по вашему вопросу.")
         return
 
-    # 3. Собираем контекст и источники
     context_chunks = results['documents'][0]
     sources = list(set(meta['source'] for meta in results['metadatas'][0]))
     context_text = "\n\n".join(context_chunks)
 
-    # 4. Промпт для Groq
     prompt = (
         "Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст. "
         "Если ответа нет в контексте, скажи, что не знаешь. Не добавляй информацию из своего знания.\n\n"
         "Контекст:\n{context}\n\nВопрос: {question}\n\nОтвет:"
     ).format(context=context_text, question=user_text)
 
-    # 5. Вызов Groq
     try:
         completion = client.chat.completions.create(
             model="llama-3.1-8b-instant",
