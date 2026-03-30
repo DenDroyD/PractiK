@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram RAG-бот для ЛК ПроДвижение
-Версия: 2.1 (финальная)
-Совместимость: Python 3.11+, bothost.ru (1 ГБ RAM)
+Версия: 2.2 (с исправлением ChromaDB)
+Совместимость: bothost.ru, Python 3.11+, NumPy 1.26.4
 """
 
 import os
@@ -12,11 +12,11 @@ import asyncio
 import logging
 import hashlib
 import time
+import shutil
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from functools import wraps
 
-# Telegram
 from telegram import Update, constants
 from telegram.ext import (
     Application,
@@ -26,60 +26,42 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# HTML Parsing
 from bs4 import BeautifulSoup
-
-# Vector DB
 import chromadb
 from chromadb.config import Settings
-
-# HTTP
 import requests
 
 # ==================== КОНФИГУРАЦИЯ ====================
-# Переменные окружения (задаются в панели bothost.ru)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# ID администратора (ваш: 477810377)
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "477810377"))
 
-# Пути к данным
 DATA_DIR = Path("/app/data")
 DOCS_DIR = DATA_DIR / "docs"
 CHROMA_PERSIST_DIR = DATA_DIR / "chroma_db"
 LOG_FILE = DATA_DIR / "bot.log"
 
-# === НАСТРОЙКИ МОДЕЛЕЙ (легко менять через env) ===
-# Модель Groq для генерации ответов
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-
-# Модель HuggingFace для эмбеддингов
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL", 
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
-
-# Имя коллекции в ChromaDB
 COLLECTION_NAME = "leasing_docs_v2"
 
-# === ЛИМИТЫ (оптимизация под 1 ГБ RAM) ===
-MAX_CHUNK_SIZE = 800          # Макс. размер чанка текста
-CHUNK_OVERLAP = 100           # Перекрытие при разбиении
-MAX_SEARCH_RESULTS = 5        # Сколько чанков искать
-MAX_HISTORY_MESSAGES = 5      # Сообщений в истории диалога
-MAX_PROMPT_TOKENS = 3500      # Лимит токенов в промпте
+MAX_CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+MAX_SEARCH_RESULTS = 5
+MAX_HISTORY_MESSAGES = 5
+MAX_PROMPT_TOKENS = 3500
 
-# === КЭШИРОВАНИЕ ===
-CACHE_TTL_EMBEDDINGS = 604800  # 7 дней для эмбеддингов
-CACHE_TTL_RESPONSES = 86400    # 24 часа для ответов
+CACHE_TTL_EMBEDDINGS = 604800
+CACHE_TTL_RESPONSES = 86400
 
-# === ПРИОРИТЕТЫ ИСТОЧНИКОВ ===
 SOURCE_PRIORITY = {
-    "usloviia-soglasovaniia-sdelok.html": 1.5,  # Главный справочник
-    "processy-lizingovoi-sdelki.html": 1.3,      # Процессы
-    "izmeneniia-v-dogovor.html": 1.2,            # Изменения договора
+    "usloviia-soglasovaniia-sdelok.html": 1.5,
+    "processy-lizingovoi-sdelki.html": 1.3,
+    "izmeneniia-v-dogovor.html": 1.2,
     "soglasie-na-obrabotku-personalnyx-dannyx-sopd.html": 1.0,
 }
 
@@ -94,9 +76,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КЭШ С TTL ====================
+# ==================== КЭШ ====================
 class TTLCache:
-    """Простой кэш с временем жизни"""
     def __init__(self, ttl_seconds: int):
         self._cache: Dict[str, tuple] = {}
         self._ttl = ttl_seconds
@@ -117,20 +98,16 @@ class TTLCache:
     
     async def clear(self):
         async with self._lock:
-            count = len(self._cache)
             self._cache.clear()
-            logger.info(f"Cache cleared: {count} items")
     
     def __len__(self):
         return len(self._cache)
 
-# Глобальные кэши
 embedding_cache = TTLCache(CACHE_TTL_EMBEDDINGS)
 response_cache = TTLCache(CACHE_TTL_RESPONSES)
 
-# ==================== RETRY-ДЕКОРАТОР ====================
+# ==================== RETRY ====================
 def retry_api(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
-    """Повторные попытки при ошибках API"""
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -152,17 +129,14 @@ def retry_api(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
 
 # ==================== PARSE HTML ====================
 def parse_html_with_structure(html_content: str, source_filename: str) -> List[Dict]:
-    """Извлекает текст из HTML с сохранением заголовков и таблиц"""
     soup = BeautifulSoup(html_content, "lxml")
     
-    # Удаляем ненужные элементы
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
     
     chunks = []
     current_header = ""
     
-    # Специальная обработка таблиц из processy-lizingovoi-sdelki.html
     if source_filename == "processy-lizingovoi-sdelki.html":
         for table in soup.find_all("table"):
             rows = []
@@ -216,7 +190,6 @@ def parse_html_with_structure(html_content: str, source_filename: str) -> List[D
     return chunks
 
 def smart_chunk_texts(chunks: List[Dict], max_size: int = MAX_CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[Dict]:
-    """Разбивает длинные чанки с перекрытием"""
     result = []
     for chunk in chunks:
         text = chunk["text"]
@@ -241,10 +214,9 @@ def smart_chunk_texts(chunks: List[Dict], max_size: int = MAX_CHUNK_SIZE, overla
                 result.append({**chunk, "text": current})
     return result
 
-# ==================== EMBEDDINGS (HuggingFace) ====================
+# ==================== EMBEDDINGS ====================
 @retry_api(max_attempts=3, delay=1.5, backoff=2.0)
 async def get_embedding(text: str) -> List[float]:
-    """Получает эмбеддинг через HuggingFace API с кэшированием"""
     cache_key = hashlib.md5(text.encode("utf-8")).hexdigest()
     cached = await embedding_cache.get(cache_key)
     if cached is not None:
@@ -267,7 +239,6 @@ async def get_embedding(text: str) -> List[float]:
         response.raise_for_status()
         embedding = response.json()
         
-        # Нормализуем ответ
         if isinstance(embedding, list) and embedding and isinstance(embedding[0], list):
             embedding = embedding[0]
         
@@ -280,27 +251,70 @@ async def get_embedding(text: str) -> List[float]:
             return await get_embedding(text)
         raise
 
-# ==================== CHROMADB ====================
-def init_chroma() -> chromadb.Collection:
-    """Инициализирует ChromaDB с оптимизацией памяти"""
-    chroma_client = chromadb.PersistentClient(
-        path=str(CHROMA_PERSIST_DIR),
-        settings=Settings(anonymized_telemetry=False),
-    )
+# ==================== CHROMADB С ИСПРАВЛЕНИЯМИ ====================
+_collection = None
+
+def init_chroma(force_recreate: bool = False) -> chromadb.Collection:
+    """Инициализация ChromaDB с обработкой ошибок"""
+    global _collection
     
-    return chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={
-            "hnsw:space": "cosine",
-            "hnsw:construct_num_threads": 1,
-            "hnsw:search_num_threads": 1,
-            "hnsw:ef_search": 100,
-            "hnsw:ef_construction": 100,
-        },
-    )
+    try:
+        if force_recreate and CHROMA_PERSIST_DIR.exists():
+            logger.warning("Removing corrupted ChromaDB...")
+            shutil.rmtree(CHROMA_PERSIST_DIR)
+        
+        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        
+        chroma_client = chromadb.PersistentClient(
+            path=str(CHROMA_PERSIST_DIR),
+            settings=Settings(anonymized_telemetry=False),
+        )
+        
+        try:
+            if COLLECTION_NAME in [col.name for col in chroma_client.list_collections()]:
+                collection = chroma_client.get_collection(
+                    name=COLLECTION_NAME,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:ef_search": 100,
+                    },
+                )
+                logger.info(f"Loaded existing collection: {COLLECTION_NAME}")
+            else:
+                collection = chroma_client.create_collection(
+                    name=COLLECTION_NAME,
+                    metadata={
+                        "hnsw:space": "cosine",
+                        "hnsw:ef_search": 100,
+                    },
+                )
+                logger.info(f"Created new collection: {COLLECTION_NAME}")
+        except Exception as e:
+            logger.error(f"Error accessing collection: {e}. Recreating...")
+            try:
+                chroma_client.delete_collection(COLLECTION_NAME)
+            except:
+                pass
+            collection = chroma_client.create_collection(
+                name=COLLECTION_NAME,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:ef_search": 100,
+                },
+            )
+        
+        _collection = collection
+        return collection
+        
+    except Exception as e:
+        logger.error(f"ChromaDB initialization failed: {e}")
+        if not force_recreate:
+            logger.info("Trying to recreate ChromaDB from scratch...")
+            return init_chroma(force_recreate=True)
+        raise
 
 def index_documents(collection: chromadb.Collection, docs_dir: Path = DOCS_DIR):
-    """Индексирует HTML-документы в ChromaDB"""
+    """Индексация документов"""
     if not docs_dir.exists():
         docs_dir.mkdir(parents=True, exist_ok=True)
         logger.warning(f"Created docs directory: {docs_dir}")
@@ -336,7 +350,6 @@ def index_documents(collection: chromadb.Collection, docs_dir: Path = DOCS_DIR):
         logger.warning("No chunks to index")
         return
     
-    # Добавляем батчами
     batch_size = 100
     for i in range(0, len(all_chunks), batch_size):
         batch_chunks = all_chunks[i:i+batch_size]
@@ -353,45 +366,46 @@ def index_documents(collection: chromadb.Collection, docs_dir: Path = DOCS_DIR):
     
     logger.info(f"Indexing complete: {len(all_chunks)} chunks")
 
-# ==================== ПОИСК С ПРИОРИТЕТАМИ ====================
+# ==================== ПОИСК ====================
 def query_with_priority(collection: chromadb.Collection, query_embedding: List[float], 
                        user_query: str, n_results: int = MAX_SEARCH_RESULTS) -> Dict:
-    """Векторный поиск с учётом приоритета источников"""
-    raw = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=n_results * 2,
-        include=["documents", "metadatas", "distances"],
-    )
-    
-    if not raw["documents"][0]:
-        return raw
-    
-    scored = []
-    for doc, meta, dist in zip(raw["documents"][0], raw["metadatas"][0], raw["distances"][0]):
-        priority = meta.get("priority", 1.0)
-        score = (1 - dist) * priority
-        scored.append((score, doc, meta, dist))
-    
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:n_results]
-    
-    return {
-        "documents": [[item[1] for item in top]],
-        "metadatas": [[item[2] for item in top]],
-        "distances": [[item[3] for item in top]],
-    }
+    try:
+        raw = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results * 2,
+            include=["documents", "metadatas", "distances"],
+        )
+        
+        if not raw["documents"][0]:
+            return raw
+        
+        scored = []
+        for doc, meta, dist in zip(raw["documents"][0], raw["metadatas"][0], raw["distances"][0]):
+            priority = meta.get("priority", 1.0)
+            score = (1 - dist) * priority
+            scored.append((score, doc, meta, dist))
+        
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[:n_results]
+        
+        return {
+            "documents": [[item[1] for item in top]],
+            "metadatas": [[item[2] for item in top]],
+            "distances": [[item[3] for item in top]],
+        }
+    except Exception as e:
+        logger.error(f"Query error: {e}")
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
 
-# ==================== GROQ API ====================
+# ==================== GROQ ====================
 @retry_api(max_attempts=3, delay=1.0, backoff=2.0)
 async def call_groq(prompt: str, temperature: float = 0.2, max_tokens: int = 1024) -> str:
-    """Вызов Groq API"""
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     
-    # Обрезаем промпт, если слишком длинный
     if len(prompt) > MAX_PROMPT_TOKENS * 4:
         prompt = prompt[:MAX_PROMPT_TOKENS * 4] + "\n\n[...обрезано...]"
         logger.warning("Prompt truncated")
@@ -413,7 +427,6 @@ async def call_groq(prompt: str, temperature: float = 0.2, max_tokens: int = 102
 
 # ==================== ПРОМПТ ====================
 def build_prompt(context_chunks: List[str], user_query: str, history: str = "") -> str:
-    """Собирает промпт для LLM"""
     context_text = "\n\n---\n\n".join([
         f"[Источник: {c.get('source', 'unknown')}] " + (c["text"] if isinstance(c, dict) else c)
         for c in context_chunks
@@ -442,7 +455,7 @@ def build_prompt(context_chunks: List[str], user_query: str, history: str = "") 
     history_part = f"\nИстория:\n{history}\n" if history else ""
     return base.format(context=context_text, history=history_part, question=user_query)
 
-# ==================== ПАМЯТЬ ДИАЛОГА ====================
+# ==================== ПАМЯТЬ ====================
 user_conversations: Dict[int, List[Dict]] = {}
 
 def add_to_history(chat_id: int, role: str, content: str):
@@ -500,12 +513,14 @@ async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text("🔄 Переиндексация...")
     try:
+        global _collection
         client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
         try:
             client.delete_collection(COLLECTION_NAME)
         except:
             pass
-        collection = init_chroma()
+        _collection = None
+        collection = init_chroma(force_recreate=True)
         index_documents(collection)
         await embedding_cache.clear()
         await response_cache.clear()
@@ -545,7 +560,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.chat.send_action(constants.ChatAction.TYPING)
     
-    # Кэш ответов
     cache_key = f"resp:{chat_id}:{hashlib.md5(text.encode()).hexdigest()}"
     cached = await response_cache.get(cache_key)
     if cached:
@@ -554,11 +568,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # 1. Эмбеддинг
-        query_emb = await get_embedding(text)
-        
-        # 2. Поиск
         collection = init_chroma()
+        query_emb = await get_embedding(text)
         results = query_with_priority(collection, query_emb, text)
         
         if not results["documents"][0]:
@@ -574,7 +585,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_to_history(chat_id, "assistant", fallback)
             return
         
-        # 3. Промпт и ответ
         context_chunks = results["documents"][0]
         history = get_history(chat_id)
         prompt = build_prompt(context_chunks, text, history)
@@ -590,29 +600,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await update.message.reply_text(
-            "⚠️ Ошибка обработки.\nПопробуйте ещё раз или напишите администратору."
+            "⚠️ Ошибка обработки.\n"
+            "Попробуйте ещё раз или напишите администратору.\n"
+            f"(Детали: {str(e)[:100]})"
         )
 
 # ==================== ЗАПУСК ====================
 def main():
-    """Точка входа"""
-    # Создаём папки
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
-    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     
-    # Индексация при первом запуске
-    if not list(CHROMA_PERSIST_DIR.glob("*")):
-        logger.info("First run: indexing documents...")
+    logger.info("Initializing ChromaDB...")
+    try:
         collection = init_chroma()
-        index_documents(collection)
-    else:
-        logger.info("ChromaDB ready")
+        if collection.count() == 0:
+            logger.info("First run: indexing documents...")
+            index_documents(collection)
+        else:
+            logger.info(f"ChromaDB ready with {collection.count()} documents")
+    except Exception as e:
+        logger.error(f"Failed to initialize ChromaDB: {e}")
+        logger.info("Trying to recreate...")
+        try:
+            collection = init_chroma(force_recreate=True)
+            index_documents(collection)
+        except Exception as e2:
+            logger.error(f"Critical error: {e2}")
+            raise
     
-    # Приложение
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear_history))
