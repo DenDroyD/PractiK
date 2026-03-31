@@ -1,12 +1,11 @@
 import os
 import logging
 import glob
-import asyncio
 import time
 import requests
 import shutil
 from functools import lru_cache
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 from dotenv import load_dotenv
 import telegram
 from telegram import Update
@@ -91,7 +90,7 @@ bm25 = None
 tokenized_corpus = []
 
 # --- Настройки поиска ---
-TOP_K_VECTOR = 20          # увеличено для лучшего охвата
+TOP_K_VECTOR = 30          # увеличен для лучшего охвата таблиц
 TOP_K_FINAL = 5
 ALPHA = 0.6
 
@@ -115,17 +114,52 @@ ABBREVIATIONS = {
 }
 
 def expand_query(query: str) -> str:
-    """Заменяет сокращения в запросе на полные варианты для улучшения поиска."""
-    words = query.split()
+    """Заменяет сокращения и добавляет синонимы для улучшения поиска."""
+    words = query.lower().split()
     expanded_words = []
     for word in words:
         word_upper = word.upper()
         if word_upper in ABBREVIATIONS:
             expanded_words.append(word)
             expanded_words.extend(ABBREVIATIONS[word_upper])
+        elif word in ('аванс', 'авансы'):
+            expanded_words.append(word)
+            expanded_words.extend(['минимальный аванс', 'авансовый платеж', 'аванс по договору лизинга', 'процент аванса'])
+        elif word in ('лимит', 'лимиты'):
+            expanded_words.append(word)
+            expanded_words.extend(['максимальный лимит', 'размер лимита', 'лимит финансирования'])
+        elif word in ('срок', 'сроки'):
+            expanded_words.append(word)
+            expanded_words.extend(['срок лизинга', 'максимальный срок', 'срок договора'])
         else:
             expanded_words.append(word)
     return " ".join(expanded_words) + " " + query
+
+# --- Улучшенное извлечение текста из HTML с сохранением таблиц ---
+def extract_text_from_html(html_path):
+    with open(html_path, 'r', encoding='utf-8') as f:
+        soup = BeautifulSoup(f, 'html.parser')
+        for tag in soup(['script', 'style', 'comment', 'header', 'footer', 'nav']):
+            tag.decompose()
+        
+        # Преобразуем таблицы в читаемый текст с разделителями
+        for table in soup.find_all('table'):
+            rows_text = []
+            for row in table.find_all('tr'):
+                cells = []
+                for cell in row.find_all(['th', 'td']):
+                    cell_text = ' '.join(cell.stripped_strings)
+                    if cell_text:
+                        cells.append(cell_text)
+                if cells:
+                    rows_text.append(' | '.join(cells))
+            if rows_text:
+                table_block = "\n[ТАБЛИЦА]\n" + "\n".join(rows_text) + "\n[/ТАБЛИЦА]\n"
+                table.replace_with(NavigableString(table_block))
+        
+        text = soup.get_text(separator='\n')
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return '\n'.join(lines)
 
 # --- Разбиение текста на чанки ---
 headers_to_split_on = [
@@ -139,15 +173,6 @@ text_splitter = RecursiveCharacterTextSplitter(
     chunk_overlap=200,
     separators=["\n\n", "\n", ".", " ", ""]
 )
-
-def extract_text_from_html(html_path):
-    with open(html_path, 'r', encoding='utf-8') as f:
-        soup = BeautifulSoup(f, 'html.parser')
-        for tag in soup(['script', 'style', 'comment']):
-            tag.decompose()
-        text = soup.get_text(separator='\n')
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        return '\n'.join(lines)
 
 def chunk_text(text):
     if any(h in text for h in ["#", "##", "###"]):
@@ -275,7 +300,7 @@ def hybrid_search(query: str):
 
     vector_results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=TOP_K_VECTOR * 2,
+        n_results=TOP_K_VECTOR,
         include=["documents", "metadatas", "distances"]
     )
     if not vector_results['documents'][0]:
@@ -334,6 +359,10 @@ async def handle_message(update: Update, context):
     sources = list(set(res[2]['source'] for res in search_results))
     context_text = "\n\n".join(context_chunks)
 
+    # Ограничиваем длину контекста (около 4000 символов)
+    if len(context_text) > 4000:
+        context_text = context_text[:4000] + "\n... (контекст сокращён)"
+
     history_str = ""
     if len(history) > 1:
         prev = history[:-1]
@@ -348,9 +377,10 @@ async def handle_message(update: Update, context):
     prompt = (
         f"{history_str}"
         f"Ты — полезный помощник, который отвечает на вопросы, используя только предоставленный контекст.\n"
-        f"Если в контексте есть информация, дай полный, точный и развёрнутый ответ.\n"
+        f"В контексте могут быть таблицы. Внимательно анализируй таблицы, особенно строки с 'Аванс', 'Лимит', 'Срок'.\n"
+        f"Если вопрос касается минимальных авансов, лимитов или сроков для конкретного типа техники, найди соответствующую строку и столбец в таблице и укажи точные проценты или значения.\n"
         f"Если информация противоречива, сообщи об этом. Если ответ требует числовых данных, выдели их **жирным**.\n"
-        f"Если ответ можно представить списком, используй маркированный список.\n"
+        f"Если можно представить списком, используй маркированный список.\n"
         f"Если для ответа не хватает информации, задай уточняющий вопрос, а не выдумывай ответ.\n\n"
         f"Контекст:\n{context_text}\n\n"
         f"Вопрос: {user_text}\n\n"
@@ -373,7 +403,14 @@ async def handle_message(update: Update, context):
 
     source_line = f"\n\n📄 Источники: {', '.join(sources)}"
     final_answer = answer + source_line
-    await update.message.reply_text(final_answer)
+
+    # Telegram ограничивает длину сообщения 4096 символами
+    if len(final_answer) > 4096:
+        parts = [final_answer[i:i+4096] for i in range(0, len(final_answer), 4096)]
+        for part in parts:
+            await update.message.reply_text(part)
+    else:
+        await update.message.reply_text(final_answer)
 
 def main():
     global chroma_client, collection
